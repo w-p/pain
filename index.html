@@ -1,4 +1,6 @@
-<!doctype html>
-<meta charset="utf-8">
-<title>pain APT repository</title>
-<p>Nothing published here yet — check back after the next release.</p>
+<!doctype html><meta charset="utf-8"><title>pain APT repository</title>
+<pre>
+curl -fsSL https://w-p.github.io/pain/pain-archive-keyring.asc | sudo gpg --dearmor -o /etc/apt/keyrings/pain.gpg
+echo "deb [signed-by=/etc/apt/keyrings/pain.gpg] https://w-p.github.io/pain ./" | sudo tee /etc/apt/sources.list.d/pain.list
+sudo apt update && sudo apt install pain
+</pre>
