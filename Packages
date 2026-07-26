@@ -74,3 +74,22 @@ Description: A cross-platform, multi-pane terminal emulator
  (nested splits, drag-resize, pane grouping with broadcast input), built on
  Alacritty's VT/PTY backend with an original GPU-rendered frontend.
 
+Package: pain
+Version: 1.4.1-1
+Architecture: amd64
+Maintainer: Will Palmer <email.william.palmer@gmail.com>
+Installed-Size: 21153
+Depends: libc6 (>= 2.39), libegl1, libvulkan1, libwayland-client0, libwayland-egl1, libx11-6, libx11-xcb1, libxcb1, libxcursor1, libxi6, libxkbcommon-x11-0, libxkbcommon0
+Recommends: mesa-vulkan-drivers
+Filename: pool/pain_1.4.1-1_amd64.deb
+Size: 5995348
+MD5sum: 2f13d2e5e5b8ccab7044c72bd76146ef
+SHA1: b04e760f037921ee47baa341d95c48ff360db67d
+SHA256: 0de99b2248f58ea34f697eb9eb7dbc77aeb73029c41d1e081e961c403ac27f3e
+Section: x11
+Priority: optional
+Description: A cross-platform, multi-pane terminal emulator
+ A cross-platform terminal emulator with a Terminator-style multi-pane UX
+ (nested splits, drag-resize, pane grouping with broadcast input), built on
+ Alacritty's VT/PTY backend with an original GPU-rendered frontend.
+
