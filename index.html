@@ -1,6 +1,19 @@
-<!doctype html><meta charset="utf-8"><title>pain APT repository</title>
+<!doctype html><meta charset="utf-8"><title>pain — Linux packages</title>
+<h1>pain</h1>
+<h2>Debian / Ubuntu</h2>
 <pre>
 curl -fsSL https://w-p.github.io/pain/pain-archive-keyring.asc | sudo gpg --dearmor -o /etc/apt/keyrings/pain.gpg
 echo "deb [signed-by=/etc/apt/keyrings/pain.gpg] https://w-p.github.io/pain ./" | sudo tee /etc/apt/sources.list.d/pain.list
-sudo apt update && sudo apt install pain
+sudo apt update &amp;&amp; sudo apt install pain
+</pre>
+<h2>Fedora / RHEL</h2>
+<pre>
+sudo dnf config-manager --add-repo https://w-p.github.io/pain/rpm/pain.repo
+sudo dnf install pain
+</pre>
+<h2>Any other distribution</h2>
+<pre>
+curl -fLO https://w-p.github.io/pain/appimage/pain-x86_64.AppImage
+chmod +x pain-x86_64.AppImage
+./pain-x86_64.AppImage
 </pre>
