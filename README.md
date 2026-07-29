@@ -243,7 +243,7 @@ theme = "Graphite"            # any built-in theme; see Themes below
 font_family = "monospace"     # any installed monospaced family
 font_size = 13                # logical size, scaled by the display's DPI factor (6-48)
 ligatures = false             # shape != and => as single glyphs (needs a ligature font)
-transparency = 1.0            # 0.0 transparent .. 1.0 opaque
+transparency = 100            # percent: 0 transparent .. 100 opaque
 background_color = ""         # empty = follow the theme; a hex value overrides it
 accent_color = "#7fa2d6"      # cursor, selection, interactive highlights
 
@@ -263,7 +263,7 @@ matches other applications on a scaled display rather than rendering smaller
 than everything else.
 
 Numeric settings are clamped to their valid range on load — `font_size` to
-6–48, `transparency` to 0.0–1.0, `scrollback_lines` to at most 1000000 — with
+6–48, `transparency` to 0–100, `scrollback_lines` to at most 1000000 — with
 a note on stderr saying what was changed. A value outside the range is used at
 the nearest end rather than reset to its default, since "as big as you'll give
 me" is a legible intent; a value that isn't a number at all falls back to the

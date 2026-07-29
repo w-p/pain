@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- Removed shell integration on Windows. To track a pane's working
+  directory, pain wrote a startup script to the temp directory and spawned
+  the shell against it — `--rcfile` for bash, `-Command` for PowerShell,
+  and a script executed inside WSL. Windows Defender flagged the result as
+  `Behavior:Win32/DefensiveEvasion.A!ml` and moved to quarantine it, which
+  is a fair reading of what that looks like from the outside.
+
+  What it cost: on Windows, a restored session reopens panes in your home
+  directory rather than their last working directory. Layout, window size,
+  shell and group still restore. cmd.exe never had it. Linux and macOS are
+  unaffected — they read the working directory from the OS process table
+  and never had anything injected.
+
+  Windows bash also goes back to reading its own startup files rather than
+  a generated one.
+
+- `font_size` and `transparency` are whole numbers now. `transparency` is a
+  percentage, so `1.0` becomes `100` and `0.7` becomes `70`. A config file
+  written before this is read and converted rather than rejected — TOML
+  tells `70` and `0.7` apart by type — so nothing else in the file reverts.
+
 ## v1.8.0
 
 - Fixed: every color rendered noticeably brighter and more washed out than

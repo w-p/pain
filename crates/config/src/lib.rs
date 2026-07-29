@@ -24,12 +24,13 @@ const APP_NAME: &str = "pain";
 /// `cosmic_text::Metrics` from the font size, and a size of zero gives a
 /// zero line height, which `cosmic_text::Buffer` asserts against — a
 /// `font_size = 0` in a hand-edited file used to panic the whole app the
-/// moment the hot-reload watcher picked the edit up. A negative size doesn't
-/// panic; it hangs, spinning at 100% CPU inside text layout and never
-/// returning. Neither is something a running terminal should ever be able to
-/// do to itself over a config edit.
-pub const MIN_FONT_SIZE: f32 = 6.0;
-pub const MAX_FONT_SIZE: f32 = 48.0;
+/// moment the hot-reload watcher picked the edit up.
+pub const MIN_FONT_SIZE: u32 = 6;
+pub const MAX_FONT_SIZE: u32 = 48;
+
+/// `transparency` is a percentage: 0 is fully transparent, 100 fully
+/// opaque.
+pub const MAX_TRANSPARENCY: u32 = 100;
 /// A ceiling on retained history per pane. Scrollback is allocated as it
 /// fills rather than up front, so this bounds how much memory a pane can
 /// eventually reach, not what it starts at.
@@ -85,7 +86,10 @@ pub struct Appearance {
     /// one-off tweak is what `background_color` is for.
     pub theme: String,
     pub font_family: String,
-    pub font_size: f32,
+    /// Point size. An integer: a terminal's font size is a small whole
+    /// number and the fractional part was never anything a user chose.
+    #[serde(deserialize_with = "int_or_float")]
+    pub font_size: u32,
     /// Shape each row's text in runs so the font can apply ligatures
     /// (`!=` rendering as `≠`), rather than rasterizing every cell
     /// independently.
@@ -99,8 +103,16 @@ pub struct Appearance {
     /// not just looked up. Neither is a cost to impose on someone who never
     /// asked for ligatures.
     pub ligatures: bool,
-    /// 0.0 (fully transparent) – 1.0 (opaque).
-    pub transparency: f32,
+    /// Window opacity as a percentage: 0 fully transparent, 100 fully
+    /// opaque.
+    ///
+    /// Configs written before 1.9 stored this as a 0.0–1.0 fraction. TOML
+    /// distinguishes `0.7` from `70` by type, so those are read as
+    /// fractions and converted rather than being rejected — otherwise the
+    /// whole file would fail to parse and every other setting in it would
+    /// silently revert to a default.
+    #[serde(deserialize_with = "percent_or_fraction")]
+    pub transparency: u32,
     /// Terminal background override, as `#rrggbb` hex.
     ///
     /// **Empty means "follow the chosen theme"**, which is the default —
@@ -151,9 +163,9 @@ impl Default for Appearance {
         Appearance {
             theme: themes::DEFAULT_THEME.to_string(),
             font_family: "monospace".to_string(),
-            font_size: 13.0,
+            font_size: 13,
             ligatures: false,
-            transparency: 1.0,
+            transparency: MAX_TRANSPARENCY,
             // Empty: follow the theme. See the field's own doc comment.
             background_color: String::new(),
             accent_color: format_hex_rgb(DEFAULT_ACCENT_RGB),
@@ -249,8 +261,35 @@ pub fn report(adjustments: &[String]) {
 /// `value` clamped into `min..=max`, or `fallback` when it's `NaN` —
 /// `f32::clamp` propagates `NaN` straight through rather than bounding it,
 /// so a `NaN` in the file would otherwise pass this check untouched.
-fn sane(value: f32, min: f32, max: f32, fallback: f32) -> f32 {
-    if value.is_nan() { fallback } else { value.clamp(min, max) }
+/// A TOML number that may be written either way. Both settings below
+/// changed from a float to an integer, and a config file predating that
+/// still has to load — serde would otherwise reject the float outright,
+/// failing the *whole* file and reverting every unrelated setting in it.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Number {
+    Int(i64),
+    Float(f64),
+}
+
+/// Reads an integer, accepting a float from an older config by rounding it.
+fn int_or_float<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    Ok(match Number::deserialize(d)? {
+        Number::Int(n) => n.clamp(0, i64::from(u32::MAX)) as u32,
+        Number::Float(f) if f.is_finite() => f.round().clamp(0.0, f64::from(u32::MAX)) as u32,
+        Number::Float(_) => 0,
+    })
+}
+
+/// Reads a 0-100 percentage, accepting the 0.0-1.0 fraction older configs
+/// stored. TOML types tell the two apart: `1` is one percent, `1.0` is the
+/// old fully-opaque fraction.
+fn percent_or_fraction<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    Ok(match Number::deserialize(d)? {
+        Number::Int(n) => n.clamp(0, i64::from(MAX_TRANSPARENCY)) as u32,
+        Number::Float(f) if f.is_finite() => (f * 100.0).round().clamp(0.0, f64::from(MAX_TRANSPARENCY)) as u32,
+        Number::Float(_) => MAX_TRANSPARENCY,
+    })
 }
 
 fn format_hex_rgb(rgb: [f32; 3]) -> String {
@@ -352,10 +391,9 @@ impl Config {
     /// A non-finite value has no intent to preserve, so it takes the
     /// default.
     fn sanitize(&mut self) -> Vec<String> {
-        let defaults = Appearance::default();
         let mut adjustments = Vec::new();
 
-        let font_size = sane(self.appearance.font_size, MIN_FONT_SIZE, MAX_FONT_SIZE, defaults.font_size);
+        let font_size = self.appearance.font_size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
         if font_size != self.appearance.font_size {
             adjustments.push(format!(
                 "font_size {} is out of range ({MIN_FONT_SIZE}-{MAX_FONT_SIZE}); using {font_size}",
@@ -364,10 +402,10 @@ impl Config {
             self.appearance.font_size = font_size;
         }
 
-        let transparency = sane(self.appearance.transparency, 0.0, 1.0, defaults.transparency);
+        let transparency = self.appearance.transparency.min(MAX_TRANSPARENCY);
         if transparency != self.appearance.transparency {
             adjustments.push(format!(
-                "transparency {} is out of range (0.0-1.0); using {transparency}",
+                "transparency {} is out of range (0-{MAX_TRANSPARENCY}); using {transparency}",
                 self.appearance.transparency
             ));
             self.appearance.transparency = transparency;
@@ -622,7 +660,7 @@ mod tests {
         let path = dir.join("nested").join("config.toml");
 
         let mut config = Config::default();
-        config.appearance.font_size = 21.0;
+        config.appearance.font_size = 21;
         config.general.default_shell = "/bin/zsh".to_string();
         config.keybindings.insert("ctrl+shift+e".to_string(), "close_pane".to_string());
 
@@ -672,22 +710,43 @@ mod tests {
         assert_eq!(config.appearance.font_size, MAX_FONT_SIZE);
     }
 
-    /// `f32::clamp` returns `NaN` unchanged, so this needs its own handling
-    /// — a clamp alone would let it straight through.
+    /// A non-numeric value can't round to an integer at all, so it reads
+    /// as zero and the range clamp takes it from there — never reaching
+    /// the renderer, which is the whole point (a zero size panics text
+    /// layout).
     #[test]
-    fn a_non_numeric_font_size_falls_back_to_the_default() {
+    fn a_non_numeric_font_size_is_clamped_rather_than_reaching_the_renderer() {
         let config = load_from_toml("nan-font", "[appearance]\nfont_size = nan\n");
-        assert_eq!(config.appearance.font_size, Appearance::default().font_size);
+        assert_eq!(config.appearance.font_size, MIN_FONT_SIZE);
     }
 
     #[test]
-    fn transparency_outside_zero_to_one_is_clamped() {
-        assert_eq!(load_from_toml("over-alpha", "[appearance]\ntransparency = 4.0\n").appearance.transparency, 1.0);
-        assert_eq!(load_from_toml("under-alpha", "[appearance]\ntransparency = -1.0\n").appearance.transparency, 0.0);
-        assert_eq!(
-            load_from_toml("nan-alpha", "[appearance]\ntransparency = nan\n").appearance.transparency,
-            Appearance::default().transparency
+    fn transparency_outside_the_percentage_range_is_clamped() {
+        assert_eq!(load_from_toml("over-alpha", "[appearance]\ntransparency = 400\n").appearance.transparency, 100);
+        assert_eq!(load_from_toml("under-alpha", "[appearance]\ntransparency = -1\n").appearance.transparency, 0);
+    }
+
+    /// Configs written before 1.9 stored these as floats — a font size with
+    /// a `.0` and transparency as a 0.0-1.0 fraction. Rejecting them would
+    /// fail the whole file and silently revert every unrelated setting in
+    /// it, so both are read and converted.
+    #[test]
+    fn a_pre_integer_config_is_read_rather_than_rejected() {
+        let config = load_from_toml(
+            "legacy-floats",
+            "[appearance]\nfont_size = 14.0\ntransparency = 0.7\n[general]\ndefault_shell = \"/bin/zsh\"\n",
         );
+        assert_eq!(config.appearance.font_size, 14);
+        assert_eq!(config.appearance.transparency, 70, "0.7 is 70%");
+        assert_eq!(config.general.default_shell, "/bin/zsh", "unrelated settings survive");
+    }
+
+    /// TOML's own types separate the two meanings, which is what makes the
+    /// conversion above unambiguous.
+    #[test]
+    fn an_integer_transparency_is_a_percentage_and_a_float_is_a_fraction() {
+        assert_eq!(load_from_toml("int-one", "[appearance]\ntransparency = 1\n").appearance.transparency, 1);
+        assert_eq!(load_from_toml("float-one", "[appearance]\ntransparency = 1.0\n").appearance.transparency, 100);
     }
 
     #[test]
@@ -700,10 +759,10 @@ mod tests {
     fn values_already_in_range_are_left_exactly_as_written() {
         let config = load_from_toml(
             "in-range",
-            "[appearance]\nfont_size = 17.5\ntransparency = 0.8\n\n[general]\nscrollback_lines = 200\n",
+            "[appearance]\nfont_size = 17\ntransparency = 80\n\n[general]\nscrollback_lines = 200\n",
         );
-        assert_eq!(config.appearance.font_size, 17.5);
-        assert_eq!(config.appearance.transparency, 0.8);
+        assert_eq!(config.appearance.font_size, 17);
+        assert_eq!(config.appearance.transparency, 80);
         assert_eq!(config.general.scrollback_lines, 200);
     }
 }

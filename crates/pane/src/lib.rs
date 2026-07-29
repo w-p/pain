@@ -1,7 +1,6 @@
 //! PTY wrapper: spawns a shell and exposes it as a plain byte stream.
 
 mod cwd;
-mod integration;
 mod term;
 
 use std::io::{Read, Write};
@@ -21,13 +20,35 @@ pub struct Size {
     pub cols: u16,
 }
 
+/// The user's default shell, resolved the way `portable_pty` itself
+/// resolves it — `$SHELL` first, then the current user's `/etc/passwd`
+/// entry.
+///
+/// Needed because naming the shell explicitly is what keeps it non-login
+/// (see `shell_command`), and a launch context where `$SHELL` isn't
+/// exported — some desktop/GUI-launcher paths, unlike an interactive
+/// terminal — would otherwise fall through to `new_default_prog` and
+/// silently give a login shell.
 #[cfg(unix)]
-fn default_shell_for_classification() -> Option<String> {
-    integration::resolve_default_shell()
+fn resolve_default_shell() -> Option<String> {
+    std::env::var("SHELL").ok().or_else(passwd_shell)
+}
+
+#[cfg(unix)]
+fn passwd_shell() -> Option<String> {
+    // Matches `portable_pty::unix::get_shell()`'s own approach exactly
+    // (down to using the same raw, not-thread-safe libc call it does —
+    // no worse here than in the dependency already making this call).
+    let ent = unsafe { libc::getpwuid(libc::getuid()) };
+    if ent.is_null() {
+        return None;
+    }
+    let shell = unsafe { std::ffi::CStr::from_ptr((*ent).pw_shell) };
+    shell.to_str().ok().map(str::to_string)
 }
 
 #[cfg(not(unix))]
-fn default_shell_for_classification() -> Option<String> {
+fn resolve_default_shell() -> Option<String> {
     None
 }
 
@@ -97,33 +118,23 @@ impl Pty {
     /// Spawns `shell` (or the platform default shell when `None`) behind a
     /// new PTY sized to `size`, starting in `cwd` if given (session
     /// restore's job — `None` elsewhere, which leaves the shell to inherit
-    /// this process's own cwd, same as running it by hand). Shells this
-    /// recognizes (`crate::integration::classify`) get OSC 7 (cwd
-    /// reporting) injected automatically, since not every shell emits it
-    /// on its own — see `crate::integration`'s doc comment for how.
+    /// this process's own cwd, same as running it by hand).
+    ///
+    /// Nothing is injected into the shell. A pane's working directory comes
+    /// from the OS process table (`app::foreground_process`) and, where the
+    /// user's own configuration emits it, OSC 7 (`crate::cwd`) — never from
+    /// a generated startup script this spawns the shell with. See
+    /// `session_cwd`'s doc comment for what that costs on Windows.
     pub fn spawn(shell: Option<&str>, size: Size, cwd: Option<&std::path::Path>) -> anyhow::Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize { rows: size.rows, cols: size.cols, pixel_width: 0, pixel_height: 0 })?;
 
-        // An explicit `shell` always wins; `None` is resolved the same
-        // way `portable_pty` itself would on Unix (`$SHELL`, then the
-        // current user's `/etc/passwd` entry — see
-        // `integration::resolve_default_shell`), purely to decide whether
-        // integration applies — Windows' own default (`%ComSpec%`, i.e.
-        // cmd.exe) isn't a family this injects into, so there's nothing
-        // to gain resolving it further there.
-        let resolved = shell.map(str::to_string).or_else(default_shell_for_classification);
-        let family = resolved.as_deref().map(integration::classify).unwrap_or(integration::Family::Other);
-
-        let mut cmd = if integration::injects(family) {
-            // Anything getting injected arguments has to be named
-            // explicitly: `new_default_prog()` panics if an argument is
-            // added to it.
-            CommandBuilder::new(resolved.as_deref().expect("classified implies resolved"))
-        } else {
-            shell_command(shell, resolved.as_deref())
-        };
-        integration::apply(&mut cmd, family);
+        // An explicit `shell` always wins; `None` is resolved the same way
+        // `portable_pty` itself would on Unix, so that naming it keeps it
+        // non-login. Windows' own default (`%ComSpec%`) needs no such
+        // resolution — there is no login-shell concept to preserve there.
+        let resolved = shell.map(str::to_string).or_else(resolve_default_shell);
+        let mut cmd = shell_command(shell, resolved.as_deref());
         Self::set_terminal_env(&mut cmd);
         if let Some(cwd) = cwd {
             cmd.cwd(cwd);
@@ -375,25 +386,21 @@ mod tests {
         );
     }
 
-    /// A real bash pane must now be spawned with **no arguments at all**,
-    /// so bash reads its own startup files exactly as it would in any
-    /// other terminal. Previously it got `--rcfile <generated script>`,
-    /// which suppressed all of them and made this module responsible for
-    /// reproducing bash's startup behaviour by hand — a responsibility it
-    /// got wrong, in ways that surfaced as users' prompts and colours
-    /// coming out mangled.
+    /// A pane's shell must be spawned with **no arguments at all** on
+    /// every platform, so it reads its own startup files exactly as it
+    /// would in any other terminal.
     ///
-    /// Checked against the `CommandBuilder` rather than by spawning,
-    /// because "no argument was added" is the whole claim and a spawned
-    /// shell can't demonstrate the absence of one.
-    #[cfg(unix)]
+    /// This is the whole claim of removing shell integration, and it is
+    /// asserted rather than left implicit because the injection it
+    /// replaced was invisible in normal use — it surfaced only as mangled
+    /// prompts, and on Windows as an antivirus detection for writing a
+    /// script to the temp directory and spawning a shell against it.
     #[test]
-    fn a_bash_pane_is_spawned_with_no_injected_arguments() {
-        let mut cmd = portable_pty::CommandBuilder::new("bash");
-        integration::apply(&mut cmd, integration::Family::Bash);
-
+    fn a_shell_is_spawned_with_no_injected_arguments() {
+        let cmd = shell_command(Some("bash"), Some("/bin/bash"));
         let args: Vec<_> = cmd.get_argv().iter().skip(1).collect();
-        assert!(args.is_empty(), "bash should be spawned exactly as the user's own terminal does, got {args:?}");
+        let expected: usize = if cfg!(target_os = "macos") { 1 } else { 0 };
+        assert_eq!(args.len(), expected, "only macOS's login `-l` is ever added, got {args:?}");
     }
 }
 

@@ -63,8 +63,8 @@ pub struct PollOutcome {
 /// PTY sizing) and the actual rendered glyph size drifting apart, even
 /// slightly, is exactly the class of bug Milestone 1's very first fix
 /// (the hardcoded `CELL_WIDTH` glyph-bleed issue) was about.
-fn scaled_font_size(font_size: f32, scale_factor: f64) -> f32 {
-    font_size * scale_factor as f32
+fn scaled_font_size(font_size: u32, scale_factor: f64) -> f32 {
+    font_size as f32 * scale_factor as f32
 }
 
 /// Fixed regardless of the user's chosen accent color — this is a
@@ -788,14 +788,14 @@ impl Graphics {
             }
             router::Action::FontSize(step) => {
                 let delta = match step {
-                    router::FontStep::Increase => 1.0,
-                    router::FontStep::Decrease => -1.0,
+                    router::FontStep::Increase => 1,
+                    router::FontStep::Decrease => -1,
                 };
-                self.set_font_size(self.settings.appearance.font_size + delta);
+                self.set_font_size(i64::from(self.settings.appearance.font_size) + delta);
                 true
             }
             router::Action::ResetFontSize => {
-                self.set_font_size(config::Appearance::default().font_size);
+                self.set_font_size(i64::from(config::Appearance::default().font_size));
                 true
             }
         })
@@ -808,8 +808,8 @@ impl Graphics {
     /// Clamped to the same bounds the config file and the settings slider
     /// use, so holding the chord down stops at a legible size instead of
     /// walking into the range that panics text layout.
-    fn set_font_size(&mut self, size: f32) {
-        let size = size.clamp(config::MIN_FONT_SIZE, config::MAX_FONT_SIZE);
+    fn set_font_size(&mut self, size: i64) {
+        let size = size.clamp(i64::from(config::MIN_FONT_SIZE), i64::from(config::MAX_FONT_SIZE)) as u32;
         if size == self.settings.appearance.font_size {
             return;
         }
@@ -1918,7 +1918,11 @@ impl Graphics {
         // clamping it here, the premultiplied shader math would still dim
         // every color by the configured level for no visible transparency
         // benefit (the compositor never blends it with anything).
-        let transparency = if platform::is_wsl() { 1.0 } else { self.settings.appearance.transparency.clamp(0.0, 1.0) };
+        let transparency = if platform::is_wsl() {
+            1.0
+        } else {
+            self.settings.appearance.transparency.min(config::MAX_TRANSPARENCY) as f32 / config::MAX_TRANSPARENCY as f32
+        };
         // The clear value never passes through a shader, so it needs the
         // sRGB→linear conversion `shader.wgsl` does for everything else
         // (see `srgb_to_linear` there for why) applied on the CPU, and the

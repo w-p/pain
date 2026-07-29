@@ -266,7 +266,7 @@ Any installed monospaced family. The settings panel lists what is
 available.
 .TP
 .B font_size
-Number from
+Whole number from
 .B 6
 to
 .BR 48 ,
@@ -276,12 +276,15 @@ Scaled by the display's DPI factor, so this is a logical size and matches
 other applications on a scaled display rather than being raw pixels.
 .TP
 .B transparency
-Number from
-.B 0.0
+Whole-number percentage from
+.B 0
 (fully transparent) to
-.B 1.0
+.B 100
 (opaque), default
-.BR 1.0 .
+.BR 100 .
+A configuration file written before version 1.9 stored this as a
+.BR 0.0 - 1.0
+fraction; those are still read and converted.
 .TP
 .B background_color
 String,
@@ -365,7 +368,10 @@ Configuration on Windows.
 .PP
 The session file, holding the saved layout, window size, and each pane's
 working directory, shell, and group, sits alongside the config file in the
-same directory. Run
+same directory.
+On Windows a pane's working directory usually cannot be determined, so
+restored panes open in the home directory; the layout, window size, shell
+and group are restored as normal. Run
 .B pain \-\-help
 to see the resolved path on the machine you are on.
 .SH ENVIRONMENT

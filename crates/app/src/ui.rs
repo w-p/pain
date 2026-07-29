@@ -211,9 +211,9 @@ struct SettingsDraft {
     /// usable way to find one.
     theme_filter: String,
     font_family: String,
-    font_size: f32,
+    font_size: u32,
     ligatures: bool,
-    transparency: f32,
+    transparency: u32,
     /// `None` means "follow the chosen theme", matching
     /// `config::Appearance::background_color`'s empty-string convention.
     background_color: Option<[f32; 3]>,
@@ -966,7 +966,14 @@ impl Ui {
                                     ui.end_row();
 
                                     grid_label(ui, "Size", label_width);
-                                    slider_field(ui, value_width, egui::Slider::new(&mut draft.font_size, 6.0..=48.0));
+                                    slider_field(
+                                        ui,
+                                        value_width,
+                                        egui::Slider::new(
+                                            &mut draft.font_size,
+                                            config::MIN_FONT_SIZE..=config::MAX_FONT_SIZE,
+                                        ),
+                                    );
                                     ui.end_row();
 
                                     grid_label(ui, "Ligatures", label_width);
@@ -1035,7 +1042,8 @@ impl Ui {
                                         slider_field(
                                             ui,
                                             value_width,
-                                            egui::Slider::new(&mut draft.transparency, 0.0..=1.0),
+                                            egui::Slider::new(&mut draft.transparency, 0..=config::MAX_TRANSPARENCY)
+                                                .suffix("%"),
                                         );
                                     });
                                     ui.end_row();
