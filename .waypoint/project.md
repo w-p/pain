@@ -66,6 +66,32 @@ New in the same pass: `Ctrl+Plus`/`Minus`/`0` font sizing (saved),
 (`"ctrl shift e"`, `"ctrl +"`) that still reads the older `+`-separated
 form so existing configs keep working.
 
+**v1.9.0 (2026-07-29): Windows shell integration removed.** Windows
+Defender flagged the v1.8.0 build as
+`Behavior:Win32/DefensiveEvasion.A!ml` and moved to quarantine it. Cause
+was `pane::integration`: to track a pane's cwd it wrote a startup script
+to `%TEMP%` and spawned the shell against it (`--rcfile`, PowerShell
+`-Command`, and `wsl.exe -- sh <script>` across the WSL boundary). That is
+a documented evasion pattern and the classifier read it correctly.
+Verified first that no dependency had changed since v1.7.0, that v1.8.0
+added no new `unsafe` or Win32 calls, and that the artifact was built by
+CI from the tagged commit — so not a compromise.
+
+The module is deleted, not dormant. Cost: **on Windows, session restore
+reopens panes at the home directory** instead of their last working
+directory; layout, window size, shell and group still restore. Splits
+never inherited cwd on any platform. Linux/macOS are unaffected — they
+read cwd from the process table and never had anything injected. The
+feature was never verified working on Windows in the first place.
+
+Also in v1.9.0: `appearance.font_size` and `appearance.transparency` are
+integers (transparency now a 0-100 percentage). Configs predating this are
+read and converted rather than rejected — serde would otherwise fail the
+whole file and silently revert every unrelated setting in it.
+
+v1.8.0 is marked pre-release with a warning note. It remains in the APT
+repo on `gh-pages`, which marking the GitHub release does not touch.
+
 **Distribution is fully automated.** Pushing a `v*` tag runs
 `.github/workflows/release.yml`, which builds four targets, publishes a
 GitHub Release with notes taken verbatim from `CHANGELOG.md`'s matching

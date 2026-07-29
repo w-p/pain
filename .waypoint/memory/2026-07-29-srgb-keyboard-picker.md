@@ -300,3 +300,72 @@ one more symbol to interpret and nothing more.
 Verified the output by temporarily adding a test that printed every row, then
 removing it — a cheap way to see list formatting in an environment where
 screenshots don't work.
+
+---
+
+## Fifth pass — Defender flagged v1.8.0; shell integration removed (v1.9.0)
+
+Windows Defender flagged `pain.exe` as
+`Behavior:Win32/DefensiveEvasion.A!ml` (severe, quarantine) on the v1.8.0
+build.
+
+**What I verified before concluding anything:**
+
+- No dependency changed between v1.7.0 and v1.8.0 — the only `Cargo.lock`
+  diff is our own seven crate versions. Not a supply-chain event.
+- v1.8.0 added **zero** new `unsafe` and zero new Win32 calls. Its
+  behavioural profile was identical to v1.7.0's.
+- The artifact was built by GitHub Actions from `704b4d6`, exactly what the
+  tag points at.
+
+**Where I was wrong.** My first explanation leaned on "unsigned binary with
+no reputation." The developer corrected it: other unsigned terminals don't
+trip this, and prior pain runs didn't either. That points at something
+specific we do, not a generic reputation score. Worth remembering — the
+reputation story was the easy explanation, not the evidenced one.
+
+**The actual cause: `pane::integration`.** To track a pane's cwd on
+Windows it wrote a startup script to `%TEMP%\pain-shell-integration\` and
+spawned the shell against it — `--rcfile` for bash, `-NoExit -Command` for
+PowerShell, and `wsl.exe -- sh <script>` across the WSL boundary. Writing a
+script to temp and executing it through a shell, especially into WSL where
+Windows AV can't observe it, is a documented evasion technique. The
+classifier was reading it correctly.
+
+Removed outright — module deleted, not left dormant. What it cost is
+narrow, and worth recording precisely because I first overstated it:
+
+- **Only** consumer of cwd is session save/restore. Windows panes now
+  reopen at the home directory.
+- Splits never inherited cwd on any platform (`graphics.rs` passes `None`),
+  so nothing changed there.
+- Linux/macOS unaffected — `injects()` was already `cfg!(not(unix))`.
+- The feature was never verified working on Windows anyway (project.md).
+
+Side benefit: Windows bash reads its own startup files again, removing the
+whole class of bug where our generated rcfile had to reproduce bash's
+startup logic by hand.
+
+## font_size and transparency are integers
+
+`font_size: u32` (points), `transparency: u32` (percent, 0-100).
+
+**The compatibility detail worth keeping:** serde would reject a float for
+an integer field, which fails the *whole* config file — silently reverting
+every unrelated setting in it, not just these two. So both fields use a
+`deserialize_with` accepting either. TOML distinguishes `70` from `0.7` by
+type, which makes the conversion unambiguous: an integer is a percentage, a
+float is the old 0.0-1.0 fraction. Verified against the developer's real
+pre-1.9 config on disk (`font_size = 16.0`, `transparency = 0.7` → 16, 70)
+via `--verbose`, not just unit tests.
+
+## Release
+
+v1.9.0. Minor, not major, though the project's own semver table says a
+removed feature is major — judgment call the developer confirmed: the
+config change is backward compatible and the removal degrades a
+platform-specific feature that never verifiably worked.
+
+v1.8.0 marked **pre-release** with a warning note pointing at v1.9.0 and
+explaining the detection. Left published rather than deleted; note that
+this does *not* remove it from the APT repo on `gh-pages`.
