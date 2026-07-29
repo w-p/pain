@@ -85,11 +85,11 @@ const TITLE_BAR_PADDING: f32 = 4.0;
 /// terminal font sizes and needs nothing beyond what glyph rasterization
 /// already does for the title text right next to it.
 const CLOSE_BUTTON_GLYPH: char = '×';
-/// Default (ungrouped) title bar colors — Graphite's own dark surface
-/// tone (`#14171b`) and ink, fixed regardless of luminance (unlike
-/// grouped panes, whose random background needs a computed contrast color
-/// instead).
-const TITLE_BAR_BG: [f32; 4] = [0.078, 0.090, 0.106, 1.0];
+/// The lighter of the two title bar text colors. Which one a bar gets is
+/// computed from its background's luminance (`contrasting_text_color`) —
+/// for a grouped pane's palette color and for the configurable ungrouped
+/// one alike, since either can be set light or dark. The background itself
+/// lives in config as `appearance.title_bar_color`.
 const TITLE_BAR_TEXT_LIGHT: [f32; 4] = TEXT_COLOR;
 /// Graphite's own ground tone, reused here as the "dark ink" choice for a
 /// bright grouped pane's title bar — the same hue family as the rest of
@@ -310,6 +310,14 @@ impl Graphics {
             );
         }
         surface.configure(&device, &config);
+        if crate::verbose::is_verbose(crate::verbose::Category::General) {
+            // Worth logging on its own: whether the surface format is an
+            // sRGB one decides whether the GPU gamma-encodes what the
+            // shader writes, which is the difference between colors
+            // matching their hex values and rendering visibly too bright
+            // (see `shader.wgsl`'s `srgb_to_linear`).
+            eprintln!("wgpu: surface format {:?}, alpha mode {:?}", config.format, config.alpha_mode);
+        }
 
         let config_path = config::Config::default_path();
         let settings = config::Config::load(&config_path);
@@ -725,6 +733,16 @@ impl Graphics {
         Ok(())
     }
 
+    /// The focused pane's current terminal modes, which decide how a key
+    /// press is encoded (see `crate::keys`). Empty if there is no focused
+    /// pane, which yields the plain legacy encoding.
+    pub fn focused_term_mode(&self) -> pane::TermMode {
+        match self.panes.get(&self.focused) {
+            Some(session) => session.screen().mode(),
+            None => pane::TermMode::empty(),
+        }
+    }
+
     /// Resolves `chord` via the keymap and, if bound, executes the action.
     /// Returns `None` if the chord isn't bound — the caller should treat
     /// the key as passthrough input instead, since a chord is never
@@ -768,7 +786,44 @@ impl Graphics {
                 self.paste_into_pane(self.focused);
                 true
             }
+            router::Action::FontSize(step) => {
+                let delta = match step {
+                    router::FontStep::Increase => 1.0,
+                    router::FontStep::Decrease => -1.0,
+                };
+                self.set_font_size(self.settings.appearance.font_size + delta);
+                true
+            }
+            router::Action::ResetFontSize => {
+                self.set_font_size(config::Appearance::default().font_size);
+                true
+            }
         })
+    }
+
+    /// Applies a new font size and writes it to `config.toml`, so a size
+    /// chosen with the zoom chords survives a restart the same way one
+    /// chosen in Settings does.
+    ///
+    /// Clamped to the same bounds the config file and the settings slider
+    /// use, so holding the chord down stops at a legible size instead of
+    /// walking into the range that panics text layout.
+    fn set_font_size(&mut self, size: f32) {
+        let size = size.clamp(config::MIN_FONT_SIZE, config::MAX_FONT_SIZE);
+        if size == self.settings.appearance.font_size {
+            return;
+        }
+        let mut settings = self.settings.clone();
+        settings.appearance.font_size = size;
+        // Applied directly rather than left to the hot-reload watcher: the
+        // watcher is the right path for the settings panel, where the write
+        // *is* the user's action, but a keypress has to take effect on the
+        // next frame whether or not the config file can be written at all.
+        self.apply_settings(settings.clone());
+        if let Err(err) = settings.save(&config::Config::default_path()) {
+            eprintln!("failed to save font size: {err:#}");
+        }
+        self.saved_settings = settings;
     }
 
     /// Splits the focused pane, spawning a fresh shell into the new pane and
@@ -1613,9 +1668,24 @@ impl Graphics {
         // semantic signal, these are interactive/focus highlights, the
         // category the accent color exists to theme.
         let accent_rgb = self.settings.appearance.accent_rgb();
-        let cursor_color = [accent_rgb[0], accent_rgb[1], accent_rgb[2], 0.5];
-        let accent_color = [accent_rgb[0], accent_rgb[1], accent_rgb[2], 1.0];
-        let selection_color = [accent_rgb[0], accent_rgb[1], accent_rgb[2], 0.45];
+        let title_bar_rgb = with_alpha(self.settings.appearance.title_bar_rgb(), 1.0);
+        let accent_color = with_alpha(accent_rgb, 1.0);
+        // Both of these used to be drawn as partly-transparent accent over
+        // the pane, which reads correctly against an opaque window but is
+        // wrong in general: this alpha channel is also what the compositor
+        // uses for *window* transparency, so a translucent cursor let the
+        // desktop show through the one part of the terminal that should
+        // always be solid. The blend they wanted is with the pane's own
+        // background, so it is done here, against that color, and what
+        // reaches the renderer is fully opaque.
+        //
+        // The cursor is a solid block rather than a blend, which is what
+        // every terminal draws; the glyph beneath it is drawn in a
+        // contrasting color instead (see `cursor_glyph_color`), the same
+        // reverse-video treatment, so the character under the cursor stays
+        // readable.
+        let cursor_color = accent_color;
+        let selection_color = with_alpha(blend(accent_rgb, background_rgb, 0.45), 1.0);
 
         let mut rects: Vec<render::SolidRect> = geometry
             .dividers
@@ -1670,7 +1740,11 @@ impl Graphics {
                         let bg = group_color(&g.0);
                         (bg, contrasting_text_color(bg))
                     }
-                    None => (TITLE_BAR_BG, TITLE_BAR_TEXT_LIGHT),
+                    // The configured color, whose text color is computed
+                    // the same way a group's is — someone who picks a pale
+                    // title bar should get dark text on it without having
+                    // to also configure that.
+                    None => (title_bar_rgb, contrasting_text_color(title_bar_rgb)),
                 };
                 rects.push(render::SolidRect {
                     x: full.x,
@@ -1801,7 +1875,16 @@ impl Graphics {
                             });
                         }
 
-                        let [r, g, b] = color::resolve(fg_src, rc.flags, true, foreground_rgb, &palette);
+                        // Reverse video under a solid block cursor: the
+                        // character keeps its shape but takes a color that
+                        // contrasts with the cursor, instead of being drawn
+                        // in its own color on top of an accent-colored block
+                        // it may be nearly invisible against.
+                        let [r, g, b] = if cursor == Some((row, col)) {
+                            cursor_glyph_color(accent_rgb)
+                        } else {
+                            color::resolve(fg_src, rc.flags, true, foreground_rgb, &palette)
+                        };
                         if ligatures {
                             // Every cell, spaces included: `run::split` needs
                             // them to know where runs end.
@@ -1836,8 +1919,20 @@ impl Graphics {
         // every color by the configured level for no visible transparency
         // benefit (the compositor never blends it with anything).
         let transparency = if platform::is_wsl() { 1.0 } else { self.settings.appearance.transparency.clamp(0.0, 1.0) };
-        let [bg_r, bg_g, bg_b] = background_rgb;
-        let background = wgpu::Color { r: bg_r as f64, g: bg_g as f64, b: bg_b as f64, a: transparency as f64 };
+        // The clear value never passes through a shader, so it needs the
+        // sRGB→linear conversion `shader.wgsl` does for everything else
+        // (see `srgb_to_linear` there for why) applied on the CPU, and the
+        // premultiplication by alpha that the fragment shader likewise does
+        // for every quad it draws. Without the premultiply the compositor
+        // adds an unscaled background to whatever is behind the window, so
+        // a transparent terminal reads brighter than its own opaque one.
+        let [bg_r, bg_g, bg_b] = background_rgb.map(srgb_decode);
+        let background = wgpu::Color {
+            r: (bg_r * transparency) as f64,
+            g: (bg_g * transparency) as f64,
+            b: (bg_b * transparency) as f64,
+            a: transparency as f64,
+        };
         self.grid.render(
             &self.device,
             &self.queue,
@@ -2037,29 +2132,52 @@ fn group_color(name: &str) -> [f32; 4] {
     GROUP_COLOR_PALETTE[(hasher.finish() as usize) % GROUP_COLOR_PALETTE.len()]
 }
 
-/// Approximates a linear 0.0–1.0 color channel's *displayed* brightness.
-/// The swapchain format is `Bgra8UnormSrgb` (confirmed via egui's own
-/// startup log line) — an sRGB-aware target, which means the GPU always
-/// gamma-encodes whatever a shader writes on its way to the screen. A
-/// color that looks like a moderate 0.0–1.0 value in the source displays
-/// noticeably *brighter* once that encoding happens (sRGB's curve boosts
-/// mid-range values well above their linear input — linear 0.5 displays
-/// close to 0.735). `contrasting_text_color` needs this, not the raw
-/// value, to judge how bright a background will actually look.
-fn srgb_encode(linear: f32) -> f32 {
-    if linear <= 0.003_130_8 { linear * 12.92 } else { 1.055 * linear.powf(1.0 / 2.4) - 0.055 }
+/// An RGB color with an alpha channel attached, for the renderer.
+fn with_alpha(rgb: [f32; 3], alpha: f32) -> [f32; 4] {
+    [rgb[0], rgb[1], rgb[2], alpha]
+}
+
+/// `color` composited over `under` at `amount` opacity, as an opaque result.
+///
+/// Lets a highlight keep the look of a partly-transparent overlay without
+/// actually being transparent — which matters because the alpha channel
+/// reaching the renderer is also the window's transparency, so a
+/// "half-transparent" highlight is half-transparent to the *desktop*, not
+/// just to the pane behind it.
+fn blend(color: [f32; 3], under: [f32; 3], amount: f32) -> [f32; 3] {
+    let mix = |a: f32, b: f32| a * amount + b * (1.0 - amount);
+    [mix(color[0], under[0]), mix(color[1], under[1]), mix(color[2], under[2])]
+}
+
+/// The color to draw the character sitting under the block cursor, given
+/// the cursor's own color — light or dark, whichever the cursor contrasts
+/// with. The standard reverse-video treatment: the cell inverts rather than
+/// the cursor becoming see-through.
+fn cursor_glyph_color(cursor_rgb: [f32; 3]) -> [f32; 3] {
+    let [r, g, b, _] = contrasting_text_color(with_alpha(cursor_rgb, 1.0));
+    [r, g, b]
+}
+
+/// Converts an sRGB 0.0–1.0 color channel to linear — the CPU-side twin of
+/// `shader.wgsl`'s `srgb_to_linear`, for the one color that never reaches a
+/// shader: the window's clear value.
+fn srgb_decode(srgb: f32) -> f32 {
+    if srgb <= 0.040_45 { srgb / 12.92 } else { ((srgb + 0.055) / 1.055).powf(2.4) }
 }
 
 /// Light or dark title bar text, whichever contrasts with `bg` — perceived
 /// luminance (the standard `0.299r + 0.587g + 0.114b` weighting, not a
 /// straight average, since human vision is far more sensitive to green
-/// than red or blue) computed on the *displayed* (sRGB-encoded) color, not
-/// the raw linear input — using the raw value was consistently judging
-/// colors as darker than they actually render, so brighter backgrounds
-/// were keeping light text instead of flipping to dark.
+/// than red or blue).
+///
+/// Computed on `bg` as given, because every color in this module is an sRGB
+/// value and the renderer now displays it as one. This used to gamma-encode
+/// `bg` first, which was the right compensation for a pipeline that was
+/// double-encoding every color it drew — with that fixed at the source (see
+/// `shader.wgsl`), the same compensation here would make the judgement
+/// wrong in the other direction.
 fn contrasting_text_color(bg: [f32; 4]) -> [f32; 4] {
-    let (r, g, b) = (srgb_encode(bg[0]), srgb_encode(bg[1]), srgb_encode(bg[2]));
-    let luminance = 0.299 * r + 0.587 * g + 0.114 * b;
+    let luminance = 0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2];
     if luminance > 0.5 { TITLE_BAR_TEXT_DARK } else { TITLE_BAR_TEXT_LIGHT }
 }
 
@@ -2154,27 +2272,77 @@ mod tests {
     }
 
     #[test]
-    fn srgb_encode_matches_known_reference_points() {
-        // Standard IEC 61966-2-1 reference points.
-        assert!((srgb_encode(0.0) - 0.0).abs() < 1e-6);
-        assert!((srgb_encode(1.0) - 1.0).abs() < 1e-6);
-        assert!((srgb_encode(0.5) - 0.735).abs() < 0.005);
+    fn srgb_decode_matches_known_reference_points() {
+        // Standard IEC 61966-2-1 reference points. The endpoints have to be
+        // exact: an off-by-anything at 0.0 would tint a pure black
+        // background, which is most themes' background.
+        assert!((srgb_decode(0.0) - 0.0).abs() < 1e-6);
+        assert!((srgb_decode(1.0) - 1.0).abs() < 1e-6);
+        assert!((srgb_decode(0.5) - 0.214).abs() < 0.005);
+    }
+
+    /// The size of the error the double-encode was producing. Ayu's
+    /// background is `#0b0e14`; drawn without this conversion it reached
+    /// the display around three times as bright as specified.
+    #[test]
+    fn srgb_decode_undoes_what_an_srgb_target_re_encodes() {
+        let encode =
+            |linear: f32| if linear <= 0.003_130_8 { linear * 12.92 } else { 1.055 * linear.powf(1.0 / 2.4) - 0.055 };
+        for channel in [0x0b, 0x0e, 0x14, 0x7f, 0xd9, 0x62] {
+            let authored = channel as f32 / 255.0;
+            assert!((encode(srgb_decode(authored)) - authored).abs() < 1e-4, "channel {channel:#04x}");
+        }
+    }
+
+    /// The cursor and the selection highlight must reach the renderer fully
+    /// opaque. Their alpha channel is also the window's transparency, so any
+    /// value below 1.0 there is the desktop showing through the terminal —
+    /// not the pane-local blend the value was meant to express.
+    #[test]
+    fn highlights_are_opaque_so_the_desktop_never_shows_through_them() {
+        let accent = [0.5, 0.6, 0.8];
+        let background = [0.05, 0.05, 0.06];
+        assert_eq!(with_alpha(accent, 1.0)[3], 1.0, "cursor");
+        assert_eq!(with_alpha(blend(accent, background, 0.45), 1.0)[3], 1.0, "selection");
+    }
+
+    /// Blending on the CPU has to preserve the look the alpha channel used
+    /// to produce: the endpoints are the two source colors, and the midpoint
+    /// is halfway between them.
+    #[test]
+    fn blend_interpolates_between_the_two_colors() {
+        let over = [1.0, 0.0, 0.0];
+        let under = [0.0, 0.0, 1.0];
+        assert_eq!(blend(over, under, 1.0), over);
+        assert_eq!(blend(over, under, 0.0), under);
+        assert_eq!(blend(over, under, 0.5), [0.5, 0.0, 0.5]);
+    }
+
+    /// The character under a solid block cursor is drawn in reverse video,
+    /// so it has to contrast with the cursor rather than with the pane.
+    #[test]
+    fn the_cursor_glyph_contrasts_with_the_cursor_not_the_background() {
+        let dark_cursor = cursor_glyph_color([0.05, 0.06, 0.08]);
+        let bright_cursor = cursor_glyph_color([0.85, 0.90, 0.80]);
+        assert_ne!(dark_cursor, bright_cursor, "a light and a dark cursor need different glyph colors");
+        let luminance = |[r, g, b]: [f32; 3]| 0.299 * r + 0.587 * g + 0.114 * b;
+        assert!(luminance(dark_cursor) > 0.5, "light glyph on a dark cursor");
+        assert!(luminance(bright_cursor) < 0.5, "dark glyph on a bright cursor");
     }
 
     #[test]
-    fn contrast_accounts_for_srgb_display_brightness_not_just_raw_linear_value() {
-        // A color the raw (pre-gamma) formula would call "moderate" but
-        // that displays bright once sRGB-encoded — exactly the palette
-        // entries the developer reported as not flipping to dark text.
-        // Raw luminance here is ~0.474 (< 0.5, would wrongly pick light
-        // text); the sRGB-aware calculation must pick dark instead.
-        let teal = [0.20, 0.60, 0.55, 1.0];
+    fn contrast_picks_dark_text_for_a_bright_background() {
+        // A mid-bright teal from the group palette: luminance ~0.474 on the
+        // green-weighted scale, which is close enough to the threshold that
+        // it is worth pinning against accidental re-tuning.
+        let teal = [0.20, 0.70, 0.65, 1.0];
         assert_eq!(contrasting_text_color(teal), TITLE_BAR_TEXT_DARK);
     }
 
     #[test]
     fn contrast_still_picks_light_text_for_a_genuinely_dark_color() {
-        assert_eq!(contrasting_text_color(TITLE_BAR_BG), TITLE_BAR_TEXT_LIGHT);
+        let default_bar = with_alpha(config::Appearance::default().title_bar_rgb(), 1.0);
+        assert_eq!(contrasting_text_color(default_bar), TITLE_BAR_TEXT_LIGHT);
     }
 
     use wgpu::CompositeAlphaMode::{Opaque, PostMultiplied, PreMultiplied};

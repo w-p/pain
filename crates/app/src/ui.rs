@@ -85,7 +85,15 @@ pub struct UiEventResponse {
 
 /// One row of the settings panel's read-only keybinding list.
 struct BindingRow {
-    chord: String,
+    /// Every chord that runs this action, listed together.
+    ///
+    /// One action commonly has several, because a chord users think of as
+    /// one keystroke can reach the OS as several distinct keys — `ctrl +`
+    /// is `ctrl =` unshifted and `ctrl shift +` shifted on a US layout, and
+    /// a different key again on a numeric keypad. Listed as one row because
+    /// they *are* one binding to the person reading; as separate rows they
+    /// read as accidental duplicates.
+    chords: Vec<String>,
     action: String,
     /// Whether config changed this from the built-in default — which is
     /// the one thing this list can tell you that the docs can't.
@@ -93,7 +101,8 @@ struct BindingRow {
 }
 
 /// The keybindings actually in effect: the built-in defaults with
-/// `overrides` layered on, each marked with whether config changed it.
+/// `overrides` layered on, grouped by the action they run and marked with
+/// whether config changed them.
 ///
 /// Chords the config *unbound* are listed too, rather than simply being
 /// absent. A chord vanishing from this list is indistinguishable from one
@@ -104,25 +113,37 @@ fn effective_binding_rows(overrides: &BTreeMap<String, String>) -> Vec<BindingRo
     let mut effective = router::Keymap::terminator_defaults();
     effective.apply_overrides(overrides);
 
-    let mut rows: Vec<BindingRow> = effective
+    let bound = effective
         .bindings()
         .into_iter()
-        .map(|(chord, action)| BindingRow {
-            chord: chord.to_string(),
-            action: action.name().to_string(),
-            custom: defaults.lookup(chord) != Some(action),
+        .map(|(chord, action)| (action.name().to_string(), defaults.lookup(chord) != Some(action), chord.to_string()));
+
+    let unbound = defaults
+        .bindings()
+        .into_iter()
+        .filter(|(chord, _)| effective.lookup(*chord).is_none())
+        .map(|(chord, _)| ("(unbound)".to_string(), true, chord.to_string()));
+
+    // Grouped on `custom` as well as the action: a chord the config
+    // rebound and one that came that way by default are different facts
+    // about the same action, and merging them would put "(custom)" on
+    // bindings nobody touched.
+    let mut grouped: BTreeMap<(String, bool), Vec<String>> = BTreeMap::new();
+    for (action, custom, chord) in bound.chain(unbound) {
+        grouped.entry((action, custom)).or_default().push(chord);
+    }
+
+    let mut rows: Vec<BindingRow> = grouped
+        .into_iter()
+        .map(|((action, custom), mut chords)| {
+            chords.sort();
+            BindingRow { chords, action, custom }
         })
         .collect();
 
-    rows.extend(
-        defaults
-            .bindings()
-            .into_iter()
-            .filter(|(chord, _)| effective.lookup(*chord).is_none())
-            .map(|(chord, _)| BindingRow { chord: chord.to_string(), action: "(unbound)".to_string(), custom: true }),
-    );
-
-    rows.sort_by(|a, b| a.chord.cmp(&b.chord));
+    // By the first chord, so the list reads in the same order a reader
+    // would scan for a key they half-remember.
+    rows.sort_by(|a, b| a.chords.cmp(&b.chords));
     rows
 }
 
@@ -197,6 +218,7 @@ struct SettingsDraft {
     /// `config::Appearance::background_color`'s empty-string convention.
     background_color: Option<[f32; 3]>,
     accent_color: [f32; 3],
+    title_bar_color: [f32; 3],
     scrollback_lines: usize,
     default_shell: String,
     cursor_style: config::CursorStyle,
@@ -217,6 +239,7 @@ impl SettingsDraft {
                 Some(config.appearance.background_rgb())
             },
             accent_color: config.appearance.accent_rgb(),
+            title_bar_color: config.appearance.title_bar_rgb(),
             scrollback_lines: config.general.scrollback_lines,
             default_shell: config.general.default_shell.clone(),
             cursor_style: config.cursor.style,
@@ -246,6 +269,7 @@ impl SettingsDraft {
             None => config.appearance.follow_theme_background(),
         }
         config.appearance.set_accent_rgb(self.accent_color);
+        config.appearance.set_title_bar_rgb(self.title_bar_color);
         config.appearance.font_family = self.font_family.clone();
         config.appearance.font_size = self.font_size;
         config.appearance.ligatures = self.ligatures;
@@ -257,22 +281,21 @@ impl SettingsDraft {
     }
 }
 
-/// Theme names matching `filter` (case-insensitive substring; empty matches
-/// everything), capped at `limit`.
+/// Theme names matching `filter` — case-insensitive substring, an empty
+/// filter matching everything.
 ///
-/// Returns whether the list was truncated, so the panel can say so rather
-/// than leaving someone scrolling a list that silently stops short of the
-/// theme they're looking for.
-fn filtered_themes(filter: &str, limit: usize) -> (Vec<&'static str>, bool) {
+/// Every match is returned. This used to stop at the first hundred and tell
+/// the reader to keep typing, which reads as an instruction when someone has
+/// simply scrolled to the end of what looked like the whole list. The
+/// picker's scroll area renders only the visible rows, so the length of this
+/// list costs nothing to display.
+fn filtered_themes(filter: &str) -> Vec<&'static str> {
     let needle = filter.trim().to_lowercase();
-    let mut matches = config::themes::THEMES
+    config::themes::THEMES
         .iter()
         .map(|theme| theme.name)
-        .filter(|name| needle.is_empty() || name.to_lowercase().contains(&needle));
-
-    let shown: Vec<&'static str> = matches.by_ref().take(limit).collect();
-    let truncated = matches.next().is_some();
-    (shown, truncated)
+        .filter(|name| needle.is_empty() || name.to_lowercase().contains(&needle))
+        .collect()
 }
 
 impl Ui {
@@ -280,6 +303,14 @@ impl Ui {
         let ctx = egui::Context::default();
         install_chrome_font(&ctx);
         apply_chrome_style(&ctx);
+        // egui claims Ctrl+Plus/Minus/0 by default and uses them to scale
+        // its own widgets, which is a browser convention, not a terminal
+        // one. In a terminal those chords mean the *font size*, and they're
+        // now bound to it (`router::Action::FontSize`) — leaving egui's
+        // handler on would additionally rescale the chrome behind the
+        // terminal's back, which is what was moving the context menus out
+        // from under the cursor after pressing them.
+        ctx.options_mut(|options| options.zoom_with_keyboard = false);
         let state = egui_winit::State::new(ctx.clone(), egui::ViewportId::ROOT, window, None, None, None);
         let renderer = egui_wgpu::Renderer::new(device, format, egui_wgpu::RendererOptions::default());
         Self {
@@ -846,6 +877,27 @@ impl Ui {
                                     egui::ComboBox::from_id_salt("theme")
                                         .width(value_width)
                                         .selected_text(&draft.theme)
+                                        // egui's default is `CloseOnClick`,
+                                        // which means *any* click inside the
+                                        // dropdown shuts it — including the
+                                        // one that puts the caret in the
+                                        // filter field, making the filter
+                                        // impossible to use. Closing is
+                                        // driven explicitly from the list
+                                        // below instead.
+                                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                                        // `show_ui` wraps its body in a
+                                        // ScrollArea of its own, capped at
+                                        // `spacing.combo_height`. Left at
+                                        // that default it sat outside the
+                                        // list's own scroll area and clipped
+                                        // it, so the dropdown had two nested
+                                        // scrollbars: the visible one moved
+                                        // the whole panel a few pixels and
+                                        // the list's real one was cut off.
+                                        // Sized to fit the body so only the
+                                        // list's own scrollbar is ever live.
+                                        .height(theme_list_height(ui) + THEME_LIST_CHROME_HEIGHT)
                                         .show_ui(ui, |ui| {
                                             // The filter lives inside the
                                             // dropdown so it's right where
@@ -858,20 +910,33 @@ impl Ui {
                                             );
                                             ui.separator();
 
-                                            let (names, truncated) =
-                                                filtered_themes(&draft.theme_filter, THEME_LIST_LIMIT);
+                                            let names = filtered_themes(&draft.theme_filter);
                                             if names.is_empty() {
                                                 ui.weak("No matching theme");
                                             }
-                                            egui::ScrollArea::vertical().max_height(THEME_LIST_HEIGHT).show(ui, |ui| {
-                                                for name in names {
-                                                    ui.selectable_value(&mut draft.theme, name.to_string(), name);
-                                                }
-                                            });
-                                            if truncated {
-                                                ui.separator();
-                                                ui.weak(format!("Showing first {THEME_LIST_LIMIT} — keep typing"));
-                                            }
+                                            let row_height = theme_row_height(ui);
+                                            egui::ScrollArea::vertical()
+                                                .max_height(theme_list_height(ui))
+                                                // Always the full list
+                                                // height, never shrunk to a
+                                                // short result set: a
+                                                // dropdown that changes
+                                                // height on every keystroke
+                                                // moves the rows out from
+                                                // under the pointer.
+                                                .auto_shrink([false, false])
+                                                .show_rows(ui, row_height, names.len(), |ui, rows| {
+                                                    for name in &names[rows] {
+                                                        let entry = ui.selectable_value(
+                                                            &mut draft.theme,
+                                                            name.to_string(),
+                                                            *name,
+                                                        );
+                                                        if entry.clicked() {
+                                                            ui.close();
+                                                        }
+                                                    }
+                                                });
                                         });
                                     ui.end_row();
 
@@ -943,6 +1008,10 @@ impl Ui {
 
                                     grid_label(ui, "Accent", label_width);
                                     color_field(ui, value_width, &mut draft.accent_color);
+                                    ui.end_row();
+
+                                    grid_label(ui, "Title bar", label_width);
+                                    color_field(ui, value_width, &mut draft.title_bar_color);
                                     ui.end_row();
                                 },
                             );
@@ -1103,14 +1172,28 @@ impl Ui {
                                 .default_open(false)
                                 .show(ui, |ui| {
                                     ui.set_width(ui.available_width());
-                                    for row in rows {
-                                        let text = format!("{}  \u{2192}  {}", row.chord, row.action);
-                                        if row.custom {
-                                            ui.label(format!("{text}   (custom)"));
-                                        } else {
-                                            ui.weak(text);
-                                        }
-                                    }
+                                    // Two columns, no header and no borders:
+                                    // the pairing is what an aligned column
+                                    // already says, so the arrow that used to
+                                    // sit between chord and action was one
+                                    // more symbol to interpret and nothing
+                                    // more.
+                                    egui::Grid::new("keybindings-list-grid")
+                                        .num_columns(2)
+                                        .spacing([GRID_COLUMN_GAP, 4.0])
+                                        .show(ui, |ui| {
+                                            for row in rows {
+                                                let chords = row.chords.join(", ");
+                                                if row.custom {
+                                                    ui.label(chords);
+                                                    ui.label(format!("{}   (custom)", row.action));
+                                                } else {
+                                                    ui.weak(chords);
+                                                    ui.weak(&row.action);
+                                                }
+                                                ui.end_row();
+                                            }
+                                        });
                                 });
                             ui.separator();
                             // `right_to_left`: the mockup's action row is flush
@@ -1285,14 +1368,35 @@ const LABEL_COL_FRACTION: f32 = 0.26;
 /// and the `Grid::spacing` calls below can never silently drift apart.
 const GRID_COLUMN_GAP: f32 = 12.0;
 
-/// How many themes the picker lists at once, and how tall that list gets.
+/// How many themes the picker shows at once before it scrolls.
 ///
-/// There are hundreds of built-in themes; rendering every match would build
-/// hundreds of widgets each frame the dropdown is open, for a list nobody
-/// can scan anyway. The cap is paired with a "keep typing" note so a
-/// truncated list never silently masquerades as the complete set.
-const THEME_LIST_LIMIT: usize = 100;
-const THEME_LIST_HEIGHT: f32 = 260.0;
+/// All six hundred are listed; only the rows actually on screen are built
+/// each frame (`ScrollArea::show_rows`), so the list's length costs nothing.
+/// An earlier version capped it at a hundred instead, which turned scrolling
+/// to the bottom into a dead end.
+const THEME_LIST_ROWS: usize = 12;
+
+/// The height of one row in the theme list.
+///
+/// Measured from the current style rather than fixed, since the list's
+/// height is derived from it: a hardcoded number would drift out of step
+/// with the actual rows as soon as the chrome's spacing or font changed,
+/// and `show_rows` positions rows by this value — a wrong one puts the
+/// wrong slice of the list on screen.
+fn theme_row_height(ui: &egui::Ui) -> f32 {
+    ui.spacing().interact_size.y
+}
+
+/// How tall the theme list is: exactly [`THEME_LIST_ROWS`] rows.
+fn theme_list_height(ui: &egui::Ui) -> f32 {
+    let rows = THEME_LIST_ROWS as f32;
+    theme_row_height(ui) * rows + ui.spacing().item_spacing.y * (rows - 1.0)
+}
+
+/// Headroom for the filter field and separator above the theme list, so the
+/// dropdown's own scroll area is tall enough to hold the whole body and
+/// never becomes a second, competing scrollbar.
+const THEME_LIST_CHROME_HEIGHT: f32 = 48.0;
 
 /// Why the ligature checkbox is off by default, in the one place a user is
 /// actually asking the question. Names fonts rather than saying "a suitable
@@ -1506,8 +1610,22 @@ fn apply_chrome_style(ctx: &egui::Context) {
         // saner app-wide fallback than egui's stock 100px in case a
         // slider ever shows up somewhere without an explicit override.
         style.spacing.slider_width = 160.0;
+        // egui's scroll bars float over the content and allocate no width
+        // of their own by default, so a control sized to the full available
+        // width runs underneath the bar and the two overlap along the right
+        // edge — visible whether or not the bar is hovered, since it is
+        // drawn dimmed rather than hidden. Reserving the bar's own width
+        // plus a little air turns the overlap into a margin.
+        //
+        // Set on the style rather than subtracted at one call site so every
+        // scrolling region in the chrome gets the same gutter.
+        style.spacing.scroll.floating_allocated_width = style.spacing.scroll.bar_width + SCROLLBAR_GUTTER;
     });
 }
+
+/// Breathing room between a control's right edge and the scroll bar beside
+/// it, on top of the bar's own width.
+const SCROLLBAR_GUTTER: f32 = 4.0;
 
 /// The "Graphite" palette applied to egui's own chrome — context menu,
 /// settings panel — so it matches the terminal grid's own colors instead of
@@ -1588,8 +1706,9 @@ fn graphite_visuals(accent_rgb: [f32; 3]) -> egui::Visuals {
 mod tests {
     use super::*;
 
+    /// The row listing `chord`, whichever of its chords that is.
     fn row<'a>(rows: &'a [BindingRow], chord: &str) -> Option<&'a BindingRow> {
-        rows.iter().find(|row| row.chord == chord)
+        rows.iter().find(|row| row.chords.iter().any(|c| c == chord))
     }
 
     /// The reason this section changed at all: someone who has never edited
@@ -1600,20 +1719,24 @@ mod tests {
 
         assert!(!rows.is_empty());
         assert!(rows.iter().all(|row| !row.custom), "nothing is custom without any overrides");
-        assert_eq!(row(&rows, "ctrl+shift+e").map(|r| r.action.as_str()), Some("split_vertical"));
+        assert_eq!(row(&rows, "ctrl shift e").map(|r| r.action.as_str()), Some("split_vertical"));
     }
 
+    /// The override here is deliberately written in the older
+    /// `+`-separated form while the row it produces is listed in the
+    /// current space-separated one — an override in a config file someone
+    /// wrote months ago still has to find its chord.
     #[test]
     fn an_override_is_shown_in_effect_and_marked_custom() {
         let rows = effective_binding_rows(&BTreeMap::from([("ctrl+shift+e".to_string(), "close_pane".to_string())]));
 
-        let changed = row(&rows, "ctrl+shift+e").expect("still listed");
+        let changed = row(&rows, "ctrl shift e").expect("still listed");
         assert_eq!(changed.action, "close_pane");
         assert!(changed.custom);
 
         // Everything the user didn't touch stays unmarked, so "(custom)"
         // means something.
-        assert_eq!(row(&rows, "ctrl+shift+o").map(|r| r.custom), Some(false));
+        assert_eq!(row(&rows, "ctrl shift o").map(|r| r.custom), Some(false));
     }
 
     /// An unbound chord has to stay visible. Dropping it would make "I
@@ -1621,11 +1744,42 @@ mod tests {
     /// exactly the confusion someone opens this list to resolve.
     #[test]
     fn a_chord_the_config_unbound_is_listed_rather_than_dropped() {
-        let rows = effective_binding_rows(&BTreeMap::from([("ctrl+shift+x".to_string(), "none".to_string())]));
+        let rows = effective_binding_rows(&BTreeMap::from([("ctrl shift x".to_string(), "none".to_string())]));
 
-        let removed = row(&rows, "ctrl+shift+x").expect("listed even though it's unbound");
+        let removed = row(&rows, "ctrl shift x").expect("listed even though it's unbound");
         assert_eq!(removed.action, "(unbound)");
         assert!(removed.custom);
+    }
+
+    /// A chord users think of as one keystroke can reach the OS as several
+    /// distinct keys, so an action has several chords bound to it. Listed
+    /// as separate rows they read as accidental duplicates, which is
+    /// exactly how the font-size chords were first reported.
+    #[test]
+    fn chords_that_run_the_same_action_share_one_row() {
+        let rows = effective_binding_rows(&BTreeMap::new());
+
+        let increase = row(&rows, "ctrl =").expect("the unshifted form is bound");
+        assert_eq!(increase.action, "font_size_increase");
+        assert!(increase.chords.contains(&"ctrl shift +".to_string()), "the shifted form shares the row");
+        assert!(increase.chords.contains(&"ctrl +".to_string()), "and so does the keypad's");
+
+        let listed = rows.iter().filter(|r| r.action == "font_size_increase").count();
+        assert_eq!(listed, 1, "one action, one row");
+    }
+
+    /// Grouping must not merge a chord the config rebound with one that
+    /// came that way by default — that would put "(custom)" on bindings
+    /// nobody touched.
+    #[test]
+    fn a_rebound_chord_stays_separate_from_the_defaults_it_joins() {
+        let rows =
+            effective_binding_rows(&BTreeMap::from([("ctrl shift t".to_string(), "split_vertical".to_string())]));
+
+        let rebound = row(&rows, "ctrl shift t").expect("the new chord is listed");
+        assert!(rebound.custom);
+        let original = row(&rows, "ctrl shift e").expect("the default is still listed");
+        assert!(!original.custom, "an untouched default must not inherit the override's mark");
     }
 
     #[test]
@@ -1692,40 +1846,26 @@ mod tests {
         assert!(h < 500.0, "must not claim the full window height");
     }
 
+    /// Every theme is listed, not a prefix of them — the picker's scroll
+    /// area only builds the rows on screen, so there is nothing to cap.
     #[test]
-    fn an_empty_theme_filter_matches_everything_up_to_the_cap() {
-        let (names, truncated) = filtered_themes("", THEME_LIST_LIMIT);
-        assert_eq!(names.len(), THEME_LIST_LIMIT);
-        assert!(truncated, "the full collection is larger than the cap");
+    fn an_empty_theme_filter_matches_every_built_in_theme() {
+        let names = filtered_themes("");
+        assert_eq!(names.len(), config::themes::THEMES.len());
         assert_eq!(names[0], config::themes::DEFAULT_THEME, "the default should lead the unfiltered list");
+        assert!(names.contains(&"Ayu"), "a theme well past the old hundred-entry cap");
     }
 
     #[test]
     fn the_theme_filter_is_a_case_insensitive_substring_match() {
-        let (names, _) = filtered_themes("dracula", THEME_LIST_LIMIT);
+        let names = filtered_themes("dracula");
         assert!(names.contains(&"Dracula"));
         assert!(names.iter().all(|name| name.to_lowercase().contains("dracula")));
     }
 
     #[test]
-    fn a_filter_matching_nothing_returns_an_empty_untruncated_list() {
-        let (names, truncated) = filtered_themes("no such theme anywhere", THEME_LIST_LIMIT);
-        assert!(names.is_empty());
-        assert!(!truncated, "an empty result is complete, not truncated");
-    }
-
-    /// The cap exists so the dropdown doesn't build hundreds of widgets, but
-    /// a truncated list must be *reported* as truncated — silently showing
-    /// a prefix reads as "that's all there is".
-    #[test]
-    fn truncation_is_reported_only_when_matches_were_actually_dropped() {
-        let (names, truncated) = filtered_themes("", 5);
-        assert_eq!(names.len(), 5);
-        assert!(truncated);
-
-        let (names, truncated) = filtered_themes("", config::themes::THEMES.len());
-        assert_eq!(names.len(), config::themes::THEMES.len());
-        assert!(!truncated, "a list showing everything is not truncated");
+    fn a_filter_matching_nothing_returns_an_empty_list() {
+        assert!(filtered_themes("no such theme anywhere").is_empty());
     }
 
     #[test]

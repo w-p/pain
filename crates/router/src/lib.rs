@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 
 use layout::PaneId;
 
-pub use keymap::{Action, Chord, Key, Keymap};
+pub use keymap::{Action, Chord, FontStep, Key, Keymap};
 
 /// How broadcast input fans out from the focused pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

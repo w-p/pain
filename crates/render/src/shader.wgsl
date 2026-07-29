@@ -43,6 +43,31 @@ fn vs_main(v: VertexInput, inst: InstanceInput) -> VertexOutput {
     return out;
 }
 
+// Converts an sRGB color component to linear.
+//
+// Every color this renderer is handed — theme palettes, the chrome
+// constants, the accent — is an sRGB value, because that is what a hex
+// color *is*: `#ea6c73` divided by 255. The swapchain, meanwhile, is an
+// sRGB-format target, which means the GPU gamma-*encodes* whatever a shader
+// writes on its way to the display. Writing an sRGB value there encodes it a
+// second time, and the display shows a color that is substantially too
+// bright and washed out — Ayu's green `#7fd962` arriving on screen as
+// roughly `#bfefa8`. Decoding here, immediately before the write, is what
+// makes the two cancel: the value that lands in the framebuffer is the one
+// the theme actually specifies.
+//
+// This is the single conversion point for the whole grid pipeline, so no
+// caller has to know which color space it is in. egui draws through its own
+// pipeline and does this conversion itself; the window's clear color has no
+// shader to do it in and is converted on the CPU instead (see
+// `Graphics::redraw`).
+fn srgb_to_linear(color: vec3<f32>) -> vec3<f32> {
+    let cutoff = color <= vec3<f32>(0.04045);
+    let low = color / 12.92;
+    let high = pow((color + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
+    return select(high, low, cutoff);
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // A glyph the font draws in its own colors (an emoji). Its texels are
@@ -52,7 +77,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // emoji with the surrounding text color and destroy the very thing that
     // makes it a color glyph.
     if in.colored > 0.5 {
-        return textureSample(color_atlas_tex, atlas_sampler, in.uv) * in.color.a;
+        let texel = textureSample(color_atlas_tex, atlas_sampler, in.uv);
+        // The atlas holds sRGB bitmaps in a linear-format texture, so the
+        // same decode applies — but only to the color, and only once it has
+        // been divided back out of the premultiplication. Decoding a
+        // premultiplied value directly would darken semi-transparent glyph
+        // edges by the alpha's own gamma curve. Alpha itself is never
+        // gamma-encoded and passes through untouched.
+        let straight = select(texel.rgb / texel.a, vec3<f32>(0.0), texel.a <= 0.0);
+        return vec4<f32>(srgb_to_linear(straight) * texel.a, texel.a) * in.color.a;
     }
 
     let coverage = textureSample(atlas_tex, atlas_sampler, in.uv).r;
@@ -69,5 +102,5 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // atlas's reserved opaque texel, so this is a no-op for them beyond
     // their own alpha; only anti-aliased glyph edges actually need the
     // per-pixel coverage folded in here rather than on the CPU side.
-    return vec4<f32>(in.color.rgb * alpha, alpha);
+    return vec4<f32>(srgb_to_linear(in.color.rgb) * alpha, alpha);
 }

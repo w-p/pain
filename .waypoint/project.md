@@ -28,6 +28,44 @@ grid unchecked. `rustfmt.toml` was added in the same pass (`max_width = 120`,
 existing tree) and the workspace formatted, so `cargo fmt` is finally safe
 to run.
 
+**Post-1.7.0 correctness pass (2026-07-29), released as v1.8.0.** The
+developer reported theme colors "way off, not a little," a dead keyboard,
+and a broken theme picker, and asked to understand why bugs of this class
+existed at all in well-trodden territory. The honest common cause, worth
+keeping: each area was built to the minimum that made a demo look right
+and never checked against the standard. Found and fixed:
+
+- **Every color was one gamma-encode too bright.** The swapchain is
+  `Bgra8UnormSrgb`, so the GPU gamma-encodes what a shader writes; colors
+  were handed over already sRGB-encoded and encoded twice. Fixed at the
+  single point every color passes through (`shader.wgsl`'s
+  `srgb_to_linear`), which works because every color in the app — theme
+  tables and hand-picked chrome constants alike — is authored as sRGB. The
+  mechanism had already been diagnosed correctly once and *worked around*
+  at one call site (title-bar contrast) instead of fixed at the source.
+- **The keyboard layer was still Milestone 1 scaffolding** — eight named
+  keys and a text fallback. Replaced with a real encoder
+  (`crates/app/src/keys.rs`, see `.waypoint/features/keyboard-input.md`),
+  including the kitty keyboard protocol, which is what makes
+  `Shift+Enter` expressible at all.
+- **Four dependency defaults silently owned things the app should own**:
+  egui's `zoom_with_keyboard` (hijacking Ctrl+Plus/Minus to scale the
+  chrome — the cause of the reported context-menu offset), `ComboBox`'s
+  `CloseOnClick` (the theme filter closed the dropdown), `ComboBox`'s own
+  built-in `ScrollArea` (a second, competing scrollbar), and floating
+  scroll bars allocating zero width (the settings scrollbar overlapping
+  the controls). **Check egui defaults explicitly when adding chrome.**
+- **Alpha is window transparency in this renderer.** The cursor and
+  selection were drawn at partial alpha to blend with the pane, which made
+  them partly see-through to the *desktop*. Anything wanting to look
+  translucent against the pane must composite on the CPU and emit alpha
+  1.0.
+
+New in the same pass: `Ctrl+Plus`/`Minus`/`0` font sizing (saved),
+`appearance.title_bar_color`, and a space-separated keybinding format
+(`"ctrl shift e"`, `"ctrl +"`) that still reads the older `+`-separated
+form so existing configs keep working.
+
 **Distribution is fully automated.** Pushing a `v*` tag runs
 `.github/workflows/release.yml`, which builds four targets, publishes a
 GitHub Release with notes taken verbatim from `CHANGELOG.md`'s matching

@@ -2,6 +2,74 @@
 
 ## Unreleased
 
+- Fixed: every color rendered noticeably brighter and more washed out than
+  the color it was supposed to be. Themes made this obvious — Ayu's greens
+  arriving as pale mint — but it applied to the default palette and the
+  app's own chrome just as much. The window is an sRGB-format surface, so
+  the GPU applies gamma encoding to whatever is drawn; colors were being
+  handed over already encoded and so got encoded a second time. Colors now
+  match their published hex values.
+
+  The window background also renders correctly at transparency levels
+  below 1.0, where it was previously composited without being scaled by its
+  own alpha and read brighter than the opaque one.
+
+- Fixed: many standard keys did nothing. `Home`, `End`, `Page Up`,
+  `Page Down`, `Insert`, `Delete` and `F1`–`F12` had no encoding at all and
+  were silently dropped. `Shift+Tab` sent a plain tab, so it moved forward
+  through a form or completion menu instead of back. Modified cursor keys
+  (`Ctrl+Left`, `Shift+End`, ...) lost their modifier. `Alt` was not sent as
+  Meta, so readline's word-wise motions — `Alt+B`, `Alt+F`, `Alt+D` — did
+  nothing. Application cursor mode was ignored, so arrow keys used the wrong
+  form inside `vim`, `less` and anything else that enables it.
+
+  Keyboard input is now the full xterm-compatible encoding rather than the
+  handful of keys the first version implemented.
+
+- The kitty keyboard protocol is now supported, which is what lets a program
+  tell `Shift+Enter`, `Ctrl+Enter` and plain `Enter` apart. These are the
+  same byte in the traditional encoding and cannot be distinguished in it at
+  all; editors and CLI tools that offer `Shift+Enter` for a newline ask for
+  this protocol to get it. Programs that don't ask are unaffected.
+
+- Fixed, theme picker: clicking the filter box closed the dropdown, so the
+  filter could not be used. The list also stopped at the first 100 of 600
+  themes with a "keep typing" note at the bottom, and had two nested
+  scrollbars, the visible one belonging to the wrong thing. The whole list
+  now scrolls, filtering works, and it shows twelve themes at a time.
+
+- `Ctrl+Plus` and `Ctrl+Minus` change the font size by a point, and `Ctrl+0`
+  returns it to the default. The new size is saved, so it survives a
+  restart.
+
+  These chords previously did something else entirely: nothing had bound
+  them, so the UI toolkit's own handler claimed them and scaled the app's
+  menus and panels instead of the terminal font — which is what was leaving
+  the right-click menus offset from the pointer afterwards.
+
+- Fixed: the text cursor was partly transparent, so at any transparency
+  setting below fully opaque the desktop showed through it. It is now a
+  solid block with the character under it drawn in reverse video, which is
+  what other terminals draw. The selection highlight had the same problem
+  and keeps its blended appearance without being see-through.
+
+- The title bar color is now configurable, in Settings or as
+  `appearance.title_bar_color`. Its text color follows automatically, so a
+  pale title bar gets dark text. Grouped panes still take their color from
+  their group — that is the only way to tell groups apart.
+
+- Keybindings are written with spaces instead of `+`: `"ctrl shift e"`,
+  `"ctrl +"`, `"ctrl -"`. It reads better, and it means `+` and `-` are
+  writable as themselves rather than spelled out — a separator that is also
+  a key on the keyboard can't represent that key. The space key is written
+  `space`.
+
+  Existing config files are unaffected: the older `"ctrl+shift+e"` form is
+  still read.
+
+- Fixed, Settings: the scroll bar overlapped the right edge of the controls
+  beside it. It now has a margin of its own.
+
 ## v1.7.0
 
 - Fixed, Windows: starting pain opened a console window that then sat there

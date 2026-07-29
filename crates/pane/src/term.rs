@@ -118,7 +118,16 @@ impl Screen {
     pub fn new(size: Size, scrollback: usize) -> Self {
         let dimensions = TermSize { columns: size.cols as usize, lines: size.rows as usize };
         let (tx, rx) = mpsc::channel();
-        let config = Config { scrolling_history: scrollback, ..Config::default() };
+        // `kitty_keyboard` opts into the kitty keyboard protocol: it lets a
+        // program turn the mode on and query it, which `Term` then tracks
+        // for us. Off by default in `alacritty_terminal`, so a program
+        // asking for it was previously told the terminal has no such thing
+        // — and combinations the legacy encoding cannot represent at all
+        // (Shift+Enter, Ctrl+Enter) had nowhere to go. The matching encoder
+        // is `app`'s `keys` module; enabling this without one would be
+        // worse than leaving it off, since the program would then believe
+        // the sequences are coming.
+        let config = Config { scrolling_history: scrollback, kitty_keyboard: true, ..Config::default() };
         let term = Term::new(config.clone(), &dimensions, EventProxy(tx));
         Self {
             term,

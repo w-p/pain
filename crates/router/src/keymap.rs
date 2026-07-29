@@ -77,6 +77,20 @@ pub enum Action {
     CopyOrInterrupt,
     /// Paste the system clipboard into the focused pane.
     Paste,
+    /// Change the font size by one point, up or down, and save it. The step
+    /// is fixed rather than proportional: a terminal's font size is a small
+    /// number of points, and one point per press is what every terminal's
+    /// zoom chords do.
+    FontSize(FontStep),
+    /// Return the font size to the built-in default.
+    ResetFontSize,
+}
+
+/// Which way [`Action::FontSize`] moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FontStep {
+    Increase,
+    Decrease,
 }
 
 impl Action {
@@ -104,6 +118,9 @@ impl Action {
             Action::Copy => "copy",
             Action::CopyOrInterrupt => "copy_or_interrupt",
             Action::Paste => "paste",
+            Action::FontSize(FontStep::Increase) => "font_size_increase",
+            Action::FontSize(FontStep::Decrease) => "font_size_decrease",
+            Action::ResetFontSize => "font_size_reset",
         }
     }
 }
@@ -112,14 +129,21 @@ impl Action {
 /// to a user is always one they can paste back into `[keybindings]`
 /// verbatim. `logo` prints as `cmd` because the only default bindings using
 /// it are macOS's, and that's the name on the key there.
+///
+/// Segments are space-separated, which is what lets `+` and `-` be written
+/// as themselves (`ctrl +`) rather than spelled out.
 impl std::fmt::Display for Chord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for (active, name) in [(self.ctrl, "ctrl"), (self.shift, "shift"), (self.alt, "alt"), (self.logo, "cmd")] {
             if active {
-                write!(f, "{name}+")?;
+                write!(f, "{name} ")?;
             }
         }
         match self.key {
+            // The one key that can't be written as itself: a literal space
+            // is the separator. Every other character, punctuation
+            // included, prints verbatim.
+            Key::Char(' ') => write!(f, "space"),
             Key::Char(c) => write!(f, "{c}"),
             Key::Up => write!(f, "up"),
             Key::Down => write!(f, "down"),
@@ -185,6 +209,23 @@ impl Keymap {
 
         keymap.bind(Chord::new(Key::Char('x')).ctrl().shift(), Action::ToggleZoom);
 
+        // Font size. "Ctrl+Plus" is one chord to a user and several to the
+        // OS: the key reports as `=` unshifted and `+` shifted on a US
+        // layout, while a numeric keypad sends `+` with no Shift at all.
+        // All the forms are bound, because binding one of them is how a
+        // chord ends up working on the author's keyboard and nobody else's.
+        for increase in [
+            Chord::new(Key::Char('=')).ctrl(),
+            Chord::new(Key::Char('+')).ctrl().shift(),
+            Chord::new(Key::Char('+')).ctrl(),
+        ] {
+            keymap.bind(increase, Action::FontSize(FontStep::Increase));
+        }
+        for decrease in [Chord::new(Key::Char('-')).ctrl(), Chord::new(Key::Char('-')).ctrl().shift()] {
+            keymap.bind(decrease, Action::FontSize(FontStep::Decrease));
+        }
+        keymap.bind(Chord::new(Key::Char('0')).ctrl(), Action::ResetFontSize);
+
         // Ctrl+Shift+C/V, the usual Linux-terminal clipboard chords, are
         // deliberately *not* bound. They only ever existed as a workaround
         // for the unshifted pair being unavailable, and on both platforms
@@ -210,7 +251,7 @@ impl Keymap {
             // whenever there's no selection, see `CopyOrInterrupt`. Ctrl+V
             // genuinely does displace readline's `quoted-insert`; that's a
             // deliberate trade, since inserting a literal control character
-            // is rare next to pasting, and `"ctrl+v" = "none"` in config
+            // is rare next to pasting, and `"ctrl v" = "none"` in config
             // restores it.
             keymap.bind(Chord::new(Key::Char('c')).ctrl(), Action::CopyOrInterrupt);
             keymap.bind(Chord::new(Key::Char('v')).ctrl(), Action::Paste);
@@ -241,7 +282,7 @@ impl Keymap {
     }
 
     /// Layers config-file overrides (chord string -> action name, e.g.
-    /// `"ctrl+shift+e" -> "split_vertical"`) onto this keymap — see
+    /// `"ctrl shift e" -> "split_vertical"`) onto this keymap — see
     /// `.waypoint/design/config-system.md`'s `[keybindings]` schema. An
     /// action name of `"none"` unbinds the chord without a replacement.
     /// An unparseable chord or unrecognized action name is reported to
@@ -273,18 +314,25 @@ impl Keymap {
     }
 }
 
-/// Parses a chord string like `"ctrl+shift+e"` (case-insensitive,
-/// `+`-separated, modifiers in any order, exactly one non-modifier segment
-/// — a single character or an arrow-key name). `logo`/`super`/`cmd`/`win`
-/// all mean the same modifier: a user can still choose to bind it
-/// themselves even though no *default* binding uses it (see
-/// `terminator_defaults`'s doc comment for why we don't ship one).
+/// Parses a chord string like `"ctrl shift e"` (case-insensitive,
+/// space-separated, modifiers in any order, exactly one non-modifier segment
+/// — a single character, an arrow-key name, or `space`).
+/// `logo`/`super`/`cmd`/`win` all mean the same modifier: a user can still
+/// choose to bind it themselves even though no *default* binding uses it
+/// (see `terminator_defaults`'s doc comment for why we don't ship one).
+///
+/// Spaces rather than `+` so that `+` and `-` can be written as themselves
+/// (`ctrl +`) instead of being spelled out — a separator that is also a key
+/// on the keyboard cannot represent that key. `+` is still accepted as a
+/// separator, because configs written against the older format are on disk
+/// and a chord that silently stopped parsing would just look like a
+/// keybinding that stopped working.
 fn parse_chord(s: &str) -> Option<Chord> {
     let (mut ctrl, mut shift, mut alt, mut logo) = (false, false, false, false);
     let mut key: Option<Key> = None;
 
-    for part in s.split('+') {
-        let part = part.trim().to_ascii_lowercase();
+    for part in segments(s) {
+        let part = part.to_ascii_lowercase();
         let parsed_key = match part.as_str() {
             "ctrl" | "control" => {
                 ctrl = true;
@@ -306,6 +354,13 @@ fn parse_chord(s: &str) -> Option<Chord> {
             "down" => Key::Down,
             "left" => Key::Left,
             "right" => Key::Right,
+            // A literal space is the separator, so this is the one key
+            // that needs a name. The rest are accepted as aliases only
+            // because the older `+`-separated format had to spell them out.
+            "space" => Key::Char(' '),
+            "plus" => Key::Char('+'),
+            "minus" => Key::Char('-'),
+            "equals" | "equal" => Key::Char('='),
             other => {
                 let mut chars = other.chars();
                 let c = chars.next()?;
@@ -323,6 +378,24 @@ fn parse_chord(s: &str) -> Option<Chord> {
     }
 
     Some(Chord { key: key?, ctrl, shift, alt, logo })
+}
+
+/// Splits a chord string into its segments, accepting either separator.
+///
+/// Whitespace is the real one. A segment that still contains `+` is split
+/// again on it, which is what keeps `"ctrl+shift+e"` from older configs
+/// working — but a segment that *is* `+` is the plus key itself and is left
+/// alone, so `"ctrl +"` means what it looks like.
+fn segments(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    for part in s.split_whitespace() {
+        if part == "+" {
+            parts.push(part);
+        } else {
+            parts.extend(part.split('+').filter(|piece| !piece.is_empty()));
+        }
+    }
+    parts
 }
 
 /// Parses an action name as it appears in `[keybindings]` — the same set
@@ -350,6 +423,9 @@ fn parse_action(s: &str) -> Option<Action> {
         "copy" => Action::Copy,
         "copy_or_interrupt" => Action::CopyOrInterrupt,
         "paste" => Action::Paste,
+        "font_size_increase" => Action::FontSize(FontStep::Increase),
+        "font_size_decrease" => Action::FontSize(FontStep::Decrease),
+        "font_size_reset" => Action::ResetFontSize,
         _ => return None,
     })
 }
@@ -450,6 +526,48 @@ mod tests {
                 assert_eq!(parse_action(action.name()), Some(action), "action {:?}", action.name());
             }
         }
+    }
+
+    /// The point of the space separator: `+` and `-` are ordinary keys and
+    /// have to be writable as themselves. Under the old `+`-separated
+    /// format neither could be, which is why they had to be spelled out.
+    #[test]
+    fn punctuation_keys_are_written_as_themselves() {
+        assert_eq!(parse_chord("ctrl +"), Some(Chord::new(Key::Char('+')).ctrl()));
+        assert_eq!(parse_chord("ctrl -"), Some(Chord::new(Key::Char('-')).ctrl()));
+        assert_eq!(parse_chord("ctrl shift +"), Some(Chord::new(Key::Char('+')).ctrl().shift()));
+        assert_eq!(Chord::new(Key::Char('+')).ctrl().to_string(), "ctrl +");
+        assert_eq!(Chord::new(Key::Char('-')).ctrl().to_string(), "ctrl -");
+    }
+
+    /// Space is the separator, so the space *key* is the one that needs a
+    /// name — and it has to survive the round trip like any other.
+    #[test]
+    fn the_space_key_is_named_rather_than_written_literally() {
+        let chord = Chord::new(Key::Char(' ')).ctrl();
+        assert_eq!(chord.to_string(), "ctrl space");
+        assert_eq!(parse_chord("ctrl space"), Some(chord));
+    }
+
+    /// Config files written against the older `+`-separated format are on
+    /// disk. A chord that silently stopped parsing would look to its author
+    /// like a keybinding that stopped working for no reason.
+    #[test]
+    fn the_older_plus_separated_format_still_parses() {
+        let expected = Some(Chord::new(Key::Char('e')).ctrl().shift());
+        assert_eq!(parse_chord("ctrl+shift+e"), expected);
+        assert_eq!(parse_chord("ctrl shift e"), expected, "and so does the current one");
+        // Mixed, since accepting both separators means accepting this too.
+        assert_eq!(parse_chord("ctrl+shift e"), expected);
+        // The spelled-out names the old format needed are still accepted.
+        assert_eq!(parse_chord("ctrl+plus"), Some(Chord::new(Key::Char('+')).ctrl()));
+    }
+
+    #[test]
+    fn a_chord_with_no_key_or_two_keys_is_rejected() {
+        assert_eq!(parse_chord("ctrl"), None, "modifiers alone are not a chord");
+        assert_eq!(parse_chord("ctrl a b"), None, "two non-modifier segments");
+        assert_eq!(parse_chord(""), None);
     }
 
     /// A shortcut table rots the moment someone adds a binding and forgets

@@ -90,7 +90,7 @@ On macOS this is left alone and always interrupts.
 On Windows and Linux: paste. This displaces readline's
 .B quoted\-insert
 binding; set
-.RB \(dq ctrl+v \(dq
+.RB \(dq ctrl\ v \(dq
 to
 .RB \(dq none \(dq
 in
@@ -109,11 +109,11 @@ because the unshifted pair was unavailable, which is no longer true on
 either platform. Bind them back in
 .B [keybindings]
 if you have the muscle memory:
-.RB \(dq ctrl+shift+c \(dq
+.RB \(dq ctrl\ shift\ c \(dq
 to
 .RB \(dq copy \(dq,
 and
-.RB \(dq ctrl+shift+v \(dq
+.RB \(dq ctrl\ shift\ v \(dq
 to
 .RB \(dq paste \(dq.
 .PP
@@ -346,8 +346,8 @@ Example:
 .RS
 .nf
 [keybindings]
-"ctrl+shift+t" = "split_vertical"
-"ctrl+v" = "none"
+"ctrl shift t" = "split_vertical"
+"ctrl v" = "none"
 .fi
 .RE
 .SH FILES

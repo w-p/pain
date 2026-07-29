@@ -18,6 +18,7 @@ mod color;
 mod console;
 mod foreground_process;
 mod graphics;
+mod keys;
 mod mouse;
 mod pane_session;
 mod paste;
@@ -354,7 +355,7 @@ impl ApplicationHandler for App {
         // — it's hardcoded as egui's own focus-cycling convention ("Tab
         // always consumes", regardless of whether anything is even
         // focusable) — which silently ate Tab completion in every shell:
-        // `key_bytes` below already maps Tab to `\t` correctly, but this
+        // the `keys` encoder below maps Tab correctly, but this
         // flag being permanently true meant it was never reached. Only
         // override it while our own overlay has nothing open to cycle
         // focus between; a context menu/settings panel text field still
@@ -429,7 +430,12 @@ impl ApplicationHandler for App {
                         event_loop.exit();
                     }
                     None => {
-                        if let Some(bytes) = key_bytes(&event, self.modifiers)
+                        // The encoding depends on modes the *program* set
+                        // (application cursor keys, the kitty keyboard
+                        // protocol), so it is read from the focused pane at
+                        // press time rather than cached anywhere.
+                        let mode = graphics.focused_term_mode();
+                        if let Some(bytes) = keys::encode(keys::Press::new(&event), self.modifiers, mode)
                             && let Err(err) = graphics.send_input(&bytes)
                         {
                             eprintln!("failed to write input to pane: {err:#}");
@@ -674,7 +680,7 @@ fn is_tab_key(event: &WindowEvent) -> bool {
 ///
 /// Whether the resulting chord is actually *bound* to anything is for
 /// `Router::resolve` to decide, not this function — an unbound chord and a
-/// non-chord key both end up falling through to `key_bytes` passthrough,
+/// non-chord key both end up falling through to `keys::encode`,
 /// but for different reasons, and only one of them is this function's job.
 fn winit_chord(event: &winit::event::KeyEvent, modifiers: ModifiersState) -> Option<router::Chord> {
     if event.state != ElementState::Pressed {
@@ -704,61 +710,6 @@ fn winit_chord(event: &winit::event::KeyEvent, modifiers: ModifiersState) -> Opt
         alt: modifiers.alt_key(),
         logo: modifiers.super_key(),
     })
-}
-
-/// Translates a key press into the bytes to send to the pane's shell.
-///
-/// Bound chords are consumed by `Router::dispatch_chord` before this is
-/// ever called — every key that reaches here is either unbound or not a
-/// chord candidate at all, and passes straight through as raw input.
-///
-/// Named keys are matched before falling back to `event.text`, not after:
-/// winit populates `event.text` per-platform from the OS's own text
-/// composition (e.g. Windows' `WM_CHAR`), which for keys like Backspace can
-/// disagree with the conventional terminal byte. Concretely, Windows
-/// composes Backspace as BS (`0x08`), but sending that to cmd.exe's line
-/// editor erases a whole word, not one character — terminals conventionally
-/// send DEL (`0x7f`) for Backspace instead, precisely to avoid this. Letting
-/// `event.text` win for named keys would silently prefer the OS's
-/// composition over our deliberate convention.
-///
-/// Ctrl+letter is encoded to its control byte (Ctrl+A=1 .. Ctrl+Z=26) before
-/// the `event.text` fallback too: holding Ctrl generally suppresses normal
-/// text composition (so `event.text` would be empty anyway), and shells
-/// depend on these bytes for basics like interrupting a running program
-/// (Ctrl+C) or erasing a word (Ctrl+W).
-fn key_bytes(event: &winit::event::KeyEvent, modifiers: ModifiersState) -> Option<Vec<u8>> {
-    if event.state != winit::event::ElementState::Pressed {
-        return None;
-    }
-
-    match &event.logical_key {
-        Key::Named(NamedKey::Enter) => return Some(b"\r".to_vec()),
-        Key::Named(NamedKey::Backspace) => return Some(vec![0x7f]),
-        Key::Named(NamedKey::Tab) => return Some(b"\t".to_vec()),
-        Key::Named(NamedKey::Escape) => return Some(vec![0x1b]),
-        Key::Named(NamedKey::ArrowUp) => return Some(b"\x1b[A".to_vec()),
-        Key::Named(NamedKey::ArrowDown) => return Some(b"\x1b[B".to_vec()),
-        Key::Named(NamedKey::ArrowRight) => return Some(b"\x1b[C".to_vec()),
-        Key::Named(NamedKey::ArrowLeft) => return Some(b"\x1b[D".to_vec()),
-        _ => {}
-    }
-
-    if modifiers.control_key()
-        && let Key::Character(s) = &event.logical_key
-        && let Some(c) = s.chars().next().filter(|c| c.is_ascii_alphabetic())
-        && s.chars().count() == 1
-    {
-        return Some(vec![c.to_ascii_uppercase() as u8 - b'A' + 1]);
-    }
-
-    if let Some(text) = &event.text
-        && !text.is_empty()
-    {
-        return Some(text.as_bytes().to_vec());
-    }
-
-    None
 }
 
 #[cfg(test)]

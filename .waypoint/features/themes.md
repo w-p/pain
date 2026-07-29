@@ -68,5 +68,14 @@ the broadcast border, the activity dot — stay fixed regardless of both.
 - An unrecognised theme name resolves to the default rather than failing to
   load, and the name is preserved in the config rather than rewritten — so a
   config written by a newer version survives a downgrade.
-- The picker caps its list at 100 matches and says so. Silent truncation
-  would read as "that's all there is".
+- The picker lists every match, twelve rows at a time. It capped the list
+  at 100 and said so, which reads as an instruction ("keep typing") when
+  someone has simply scrolled to the end of what looked like the whole
+  list; `ScrollArea::show_rows` builds only the visible rows, so the cap
+  bought nothing.
+- Theme colors are sRGB values and the renderer treats them as such. They
+  were being written unconverted to an sRGB-format swapchain and so
+  gamma-encoded twice, which is why every theme rendered too bright and
+  washed out until 2026-07-29. See `render/src/shader.wgsl`'s
+  `srgb_to_linear` — the conversion belongs there, at the single point
+  every color passes through, not in this table.

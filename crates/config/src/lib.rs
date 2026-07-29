@@ -41,7 +41,7 @@ pub struct Config {
     pub general: General,
     pub appearance: Appearance,
     pub cursor: Cursor,
-    /// Chord string (e.g. `"ctrl+shift+e"`) to action name (e.g.
+    /// Chord string (e.g. `"ctrl shift e"`) to action name (e.g.
     /// `"split_vertical"`), overriding the built-in Terminator-equivalent
     /// keymap. `BTreeMap` rather than `HashMap` so `Config::save` writes a
     /// stable, deterministically ordered file. `"none"` as the action name
@@ -124,12 +124,27 @@ pub struct Appearance {
     /// same "never crash on a bad edit" fallback convention as
     /// `background_color`.
     pub accent_color: String,
+    /// The background of a pane's title bar, as `#rrggbb`.
+    ///
+    /// Only applies to panes that aren't in a group: a grouped pane's title
+    /// bar is colored by its group, which is the whole point of the group
+    /// color, and overriding that would remove the only way to tell groups
+    /// apart at a glance.
+    ///
+    /// Same "never crash on a bad edit" fallback as the colors above — an
+    /// unparseable value falls back to the default rather than failing the
+    /// load.
+    pub title_bar_color: String,
 }
 
 /// The "Graphite" palette's own accent (a desaturated slate blue) — the
 /// default `accent_color`, and the fallback if a hand-edited value fails
 /// to parse.
 const DEFAULT_ACCENT_RGB: [f32; 3] = [127.0 / 255.0, 162.0 / 255.0, 214.0 / 255.0];
+
+/// The default title bar background — the dark grey the chrome has always
+/// drawn, kept as the default so enabling the setting restyles nothing.
+const DEFAULT_TITLE_BAR_RGB: [f32; 3] = [20.0 / 255.0, 23.0 / 255.0, 27.0 / 255.0];
 
 impl Default for Appearance {
     fn default() -> Self {
@@ -142,6 +157,7 @@ impl Default for Appearance {
             // Empty: follow the theme. See the field's own doc comment.
             background_color: String::new(),
             accent_color: format_hex_rgb(DEFAULT_ACCENT_RGB),
+            title_bar_color: format_hex_rgb(DEFAULT_TITLE_BAR_RGB),
         }
     }
 }
@@ -206,6 +222,18 @@ impl Appearance {
     /// Sets `accent_color` from 0.0–1.0 RGB — the inverse of `accent_rgb`.
     pub fn set_accent_rgb(&mut self, rgb: [f32; 3]) {
         self.accent_color = format_hex_rgb(rgb);
+    }
+
+    /// Parses `title_bar_color` into 0.0–1.0 RGB, falling back to the
+    /// default dark grey if it isn't valid hex.
+    pub fn title_bar_rgb(&self) -> [f32; 3] {
+        parse_hex_rgb(&self.title_bar_color).unwrap_or(DEFAULT_TITLE_BAR_RGB)
+    }
+
+    /// Sets `title_bar_color` from 0.0–1.0 RGB — the inverse of
+    /// `title_bar_rgb`.
+    pub fn set_title_bar_rgb(&mut self, rgb: [f32; 3]) {
+        self.title_bar_color = format_hex_rgb(rgb);
     }
 }
 
@@ -562,6 +590,30 @@ mod tests {
         appearance.set_accent_rgb([0.0, 1.0, 128.0 / 255.0]);
         assert_eq!(appearance.accent_color, "#00ff80");
         assert_eq!(appearance.accent_rgb(), [0.0, 1.0, 128.0 / 255.0]);
+    }
+
+    #[test]
+    fn set_title_bar_rgb_round_trips_through_hex() {
+        let mut appearance = Appearance::default();
+        appearance.set_title_bar_rgb([1.0, 0.0, 0.5]);
+        assert_eq!(appearance.title_bar_color, "#ff0080");
+        assert_eq!(appearance.title_bar_rgb(), [1.0, 0.0, 128.0 / 255.0]);
+    }
+
+    #[test]
+    fn title_bar_color_falls_back_to_the_default_when_invalid() {
+        let appearance = Appearance { title_bar_color: "nonsense".to_string(), ..Appearance::default() };
+        assert_eq!(appearance.title_bar_rgb(), DEFAULT_TITLE_BAR_RGB);
+    }
+
+    /// A config written before this setting existed has to keep working and
+    /// keep looking the same — the field defaults in, at the color the
+    /// chrome already drew.
+    #[test]
+    fn a_config_without_a_title_bar_color_loads_at_the_previous_default() {
+        let appearance: Appearance = toml::from_str("theme = \"Dracula\"").expect("older configs still parse");
+        assert_eq!(appearance.theme, "Dracula");
+        assert_eq!(appearance.title_bar_rgb(), DEFAULT_TITLE_BAR_RGB);
     }
 
     #[test]
