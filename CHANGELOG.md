@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.8.0
+
 - Fixed: every color rendered noticeably brighter and more washed out than
   the color it was supposed to be. Themes made this obvious — Ayu's greens
   arriving as pale mint — but it applied to the default palette and the
