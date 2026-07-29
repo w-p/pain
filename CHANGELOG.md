@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.9.0
+
 - Removed shell integration on Windows. To track a pane's working
   directory, pain wrote a startup script to the temp directory and spawned
   the shell against it — `--rcfile` for bash, `-Command` for PowerShell,
