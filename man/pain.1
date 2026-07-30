@@ -196,7 +196,7 @@ to that pane, which is what actually demonstrates you saw it.
 Configuration is a TOML file, read at startup and re-read when it changes.
 Every key is optional and anything missing uses its default, so a partial
 file is valid. The file does not exist until settings are saved from the
-settings panel or you create it yourself.
+settings window or you create it yourself.
 .PP
 A malformed file is never fatal: a parse failure at startup falls back to
 defaults with a message on standard error, and a bad edit while running
@@ -244,7 +244,7 @@ Familiar names apply:
 .BR \(dqGruvbox Dark\(dq ,
 .BR \(dqSolarized Light\(dq .
 Matching ignores case, and an unrecognised name falls back to the default
-rather than failing to load. The settings panel lists them with a filter.
+rather than failing to load. The settings window lists them with a filter.
 .TP
 .B ligatures
 Boolean, default
@@ -262,7 +262,7 @@ across a color change or across the cursor.
 .B font_family
 String, default
 .BR \(dqmonospace\(dq .
-Any installed monospaced family. The settings panel lists what is
+Any installed monospaced family. The settings window lists what is
 available.
 .TP
 .B font_size

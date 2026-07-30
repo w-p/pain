@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Settings opens in its own window now, rather than as a panel floating
+  inside the terminal. It can be dragged anywhere, including onto another
+  monitor, and no longer competes with your panes for space or has to be
+  shrunk to fit a small terminal window.
+
+  Everything else about it is unchanged: edits still preview live in the
+  terminal as you make them, Save writes `config.toml`, and Cancel — or
+  closing the window — reverts the preview.
+
 ## v1.9.0
 
 - Removed shell integration on Windows. To track a pane's working

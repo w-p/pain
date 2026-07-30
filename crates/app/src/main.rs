@@ -25,6 +25,7 @@ mod paste;
 mod platform;
 mod run;
 mod session_cwd;
+mod settings_window;
 mod ui;
 mod url;
 mod verbose;
@@ -276,6 +277,46 @@ fn next_click_count(
     count
 }
 
+impl App {
+    /// Handles an event belonging to the settings window.
+    ///
+    /// Kept entirely separate from the terminal window's handling: the two
+    /// share a GPU device and nothing else. In particular `CloseRequested`
+    /// here closes the panel, where on the terminal window it quits the
+    /// application.
+    fn settings_window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
+        let Some(graphics) = &mut self.graphics else { return };
+        let repaint = graphics.settings_window_event(&event);
+
+        match event {
+            // Closing the panel without saving is cancelling it, so the
+            // live preview reverts — same as the Cancel button.
+            WindowEvent::CloseRequested => {
+                graphics.close_settings_window();
+                graphics.window().request_redraw();
+            }
+            WindowEvent::Resized(size) => {
+                graphics.resize_settings_window(size);
+                graphics.request_settings_redraw();
+            }
+            WindowEvent::RedrawRequested => {
+                // The terminal window has to be told when an edit changed
+                // the preview: it is a different window and nothing about
+                // drawing this one repaints it.
+                if graphics.redraw_settings_window() {
+                    graphics.window().request_redraw();
+                }
+            }
+            _ => {
+                if repaint {
+                    graphics.request_settings_redraw();
+                }
+            }
+        }
+        let _ = event_loop;
+    }
+}
+
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.graphics.is_some() {
@@ -339,10 +380,20 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _window_id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId, event: WindowEvent) {
         let Some(graphics) = &mut self.graphics else {
             return;
         };
+
+        // The settings window is a real, separate OS window with its own
+        // egui context (`crate::settings_window`), so its events must never
+        // reach the terminal's input handling below — a keystroke typed
+        // into the filter box is not terminal input, and a click in it is
+        // not a click on a pane.
+        if graphics.is_settings_window(window_id) {
+            self.settings_window_event(event_loop, event);
+            return;
+        }
 
         // Every event goes to the UI overlay first, so it stays in sync
         // (focus, hover, etc.) even for events it doesn't end up consuming.
@@ -409,6 +460,15 @@ impl ApplicationHandler for App {
                 if !graphics.redraw() {
                     graphics.save_session();
                     event_loop.exit();
+                    return;
+                }
+                // After `redraw`, not before: the "Settings..." click is
+                // only known once the menu has run for this frame, and
+                // waiting for the *next* frame to act on it would leave
+                // the window a frame late — or not appear at all, if
+                // nothing else asked for a repaint.
+                if graphics.take_settings_open_request() {
+                    graphics.open_settings_window(event_loop);
                 }
             }
             WindowEvent::ModifiersChanged(modifiers) => {

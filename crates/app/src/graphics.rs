@@ -136,6 +136,11 @@ const GROUP_COLOR_PALETTE: [[f32; 4]; 10] = [
 pub struct Graphics {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
+    /// Kept only so the settings window can create a second surface on the
+    /// same device (`crate::settings_window`). Both used to be locals in
+    /// `new` and dropped once the terminal's own surface existed.
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
@@ -166,6 +171,14 @@ pub struct Graphics {
     /// under it.
     hovered_url: Option<UrlHover>,
     ui: crate::ui::Ui,
+    /// The settings panel, when open — a real OS window of its own, not an
+    /// overlay on this one. `None` whenever it is closed, which is also
+    /// what discards the in-progress draft.
+    settings_window: Option<crate::settings_window::SettingsWindow>,
+    /// Set when the context menu's "Settings..." is clicked. Creating a
+    /// window needs an `ActiveEventLoop`, which only the event handler has,
+    /// so the request is parked here for `main` to collect.
+    settings_open_requested: bool,
     /// The user's config — loaded once here for now; Milestone 5.2 (hot
     /// reload) replaces this wholesale on a valid re-parse, and 5.3/5.4
     /// (keybinding overrides, settings panel) read/write the same struct
@@ -424,6 +437,8 @@ impl Graphics {
         let mut graphics = Self {
             window,
             surface,
+            instance,
+            adapter,
             device,
             queue,
             config,
@@ -438,6 +453,8 @@ impl Graphics {
             selecting: None,
             hovered_url: None,
             ui,
+            settings_window: None,
+            settings_open_requested: false,
             settings,
             saved_settings,
             config_reload_rx,
@@ -731,6 +748,103 @@ impl Graphics {
             }
         }
         Ok(())
+    }
+
+    /// Whether the context menu asked for the settings window since the
+    /// last check, clearing the request.
+    ///
+    /// Exists because opening a window needs an `ActiveEventLoop`, which
+    /// this type never has — only `main`'s event handler does.
+    pub fn take_settings_open_request(&mut self) -> bool {
+        std::mem::take(&mut self.settings_open_requested)
+    }
+
+    /// Opens the settings window, or focuses it if it is already open —
+    /// clicking "Settings..." twice should not stack two windows.
+    pub fn open_settings_window(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        if let Some(existing) = &self.settings_window {
+            existing.request_redraw();
+            return;
+        }
+        // The draft is seeded from the last *saved* config, not the live
+        // one, so a previous cancelled preview can never leak into a
+        // freshly opened panel.
+        match crate::settings_window::SettingsWindow::new(
+            event_loop,
+            &self.instance,
+            &self.adapter,
+            &self.device,
+            &self.saved_settings,
+        ) {
+            Ok(window) => {
+                window.request_redraw();
+                self.settings_window = Some(window);
+            }
+            // Not fatal: the terminal keeps working, and `config.toml` is
+            // still editable by hand.
+            Err(err) => eprintln!("failed to open the settings window: {err:#}"),
+        }
+    }
+
+    /// Asks the settings window to repaint, if it is open.
+    pub fn request_settings_redraw(&self) {
+        if let Some(window) = &self.settings_window {
+            window.request_redraw();
+        }
+    }
+
+    /// Whether `id` is the settings window's.
+    pub fn is_settings_window(&self, id: winit::window::WindowId) -> bool {
+        self.settings_window.as_ref().is_some_and(|w| w.id() == id)
+    }
+
+    /// Feeds an event to the settings window; returns whether it needs a
+    /// repaint.
+    pub fn settings_window_event(&mut self, event: &winit::event::WindowEvent) -> bool {
+        self.settings_window.as_mut().is_some_and(|w| w.on_window_event(event))
+    }
+
+    pub fn resize_settings_window(&mut self, size: winit::dpi::PhysicalSize<u32>) {
+        let device = &self.device;
+        if let Some(window) = &mut self.settings_window {
+            window.resize(device, size);
+        }
+    }
+
+    /// Draws the settings window and acts on its Save/Cancel.
+    ///
+    /// Returns whether the terminal window needs repainting too — it does
+    /// whenever an edit changed the live preview, which nothing else would
+    /// ask for now that the panel is not drawn on top of the terminal.
+    pub fn redraw_settings_window(&mut self) -> bool {
+        let Some(window) = &mut self.settings_window else { return false };
+        let outcome = window.redraw(&self.device, &self.queue, &self.saved_settings);
+
+        if let Some(new_config) = outcome.saved {
+            self.apply_settings(new_config.clone());
+            self.saved_settings = new_config;
+            self.settings_window = None;
+            return true;
+        }
+        if outcome.cancelled {
+            self.close_settings_window();
+            return true;
+        }
+
+        // The preview is applied from `poll`, which only repaints the
+        // terminal when `self.settings` actually changed — so asking for a
+        // repaint here unconditionally would spin. Compare instead.
+        let Some(window) = &self.settings_window else { return false };
+        window.preview(&self.saved_settings) != self.settings
+    }
+
+    /// Closes the settings window, discarding its draft and reverting
+    /// whatever was being previewed — the same thing Cancel does, because
+    /// closing the window without saving *is* cancelling.
+    pub fn close_settings_window(&mut self) {
+        if self.settings_window.take().is_some() {
+            self.apply_settings(self.saved_settings.clone());
+        }
     }
 
     /// The focused pane's current terminal modes, which decide how a key
@@ -1514,8 +1628,15 @@ impl Graphics {
         // *before* `self.ui.show()` runs each frame — by the time that
         // call returns with this frame's edits, it's too late for this
         // frame's own grid to reflect them.
-        if let Some(preview) = self.ui.live_preview(&self.settings) {
-            self.apply_settings(preview);
+        if let Some(settings_window) = &self.settings_window {
+            // Applied on top of the last *saved* config, not the current
+            // (already-previewed) one — otherwise each frame's preview
+            // would become the next frame's baseline and edits would
+            // compound.
+            let preview = settings_window.preview(&self.saved_settings);
+            if preview != self.settings {
+                self.apply_settings(preview);
+            }
         }
         if self.foreground_processes.maybe_refresh() && crate::verbose::is_verbose(crate::verbose::Category::Foreground)
         {
@@ -1982,21 +2103,13 @@ impl Graphics {
         if let Some(pane) = ui_request.paste_clipboard {
             self.paste_into_pane(pane);
         }
-        if let Some(new_config) = ui_request.settings_saved {
-            // Reapplies through `apply_settings` rather than assuming
-            // this frame's already-applied live preview is identical to
-            // `new_config` (normally true, but not guaranteed if the
-            // panel could ever change without going through the preview
-            // path) — cheap, and it's the one place `saved_settings`
-            // itself gets updated, which future Cancels revert to.
-            self.apply_settings(new_config.clone());
-            self.saved_settings = new_config;
-        }
         if let Some((pane, text)) = ui_request.confirm_paste {
             self.write_paste(pane, &text);
         }
-        if ui_request.settings_cancelled {
-            self.apply_settings(self.saved_settings.clone());
+        if ui_request.open_settings {
+            // Creating a window needs an `ActiveEventLoop`, which only the
+            // event handler has — parked for `main` to collect.
+            self.settings_open_requested = true;
         }
         // Unlike the title-bar close button (handled directly in
         // `main.rs`, outside of `redraw` entirely, the same way the

@@ -51,18 +51,11 @@ pub struct Ui {
     /// The settings panel's in-progress edits, if it's open. `None` means
     /// closed — there's no separate open/closed flag to keep in sync with
     /// this.
-    settings_panel: Option<SettingsDraft>,
     /// A paste awaiting the user's confirmation: the target pane and the
     /// full clipboard text. Held here (not re-read from the clipboard on
     /// confirm) so what gets sent is exactly what was described in the
     /// prompt, even if the clipboard changes while the dialog is open.
     paste_confirm: Option<(PaneId, String)>,
-    /// The keybinding rows the settings panel lists, cached alongside the
-    /// overrides they were built from. Rebuilding them is cheap, but
-    /// `Keymap::apply_overrides` reports unparseable lines to stderr — and
-    /// this panel redraws every frame, so recomputing unconditionally would
-    /// turn one bad config line into an endless stream of warnings.
-    binding_rows: Option<(BTreeMap<String, String>, Vec<BindingRow>)>,
     /// How long until egui needs to be drawn again, as of the last `show`.
     /// `Duration::MAX` means "not until something happens". See where it's
     /// assigned for why ignoring this leaves stale chrome on screen.
@@ -84,7 +77,7 @@ pub struct UiEventResponse {
 }
 
 /// One row of the settings panel's read-only keybinding list.
-struct BindingRow {
+pub struct BindingRow {
     /// Every chord that runs this action, listed together.
     ///
     /// One action commonly has several, because a chord users think of as
@@ -108,7 +101,7 @@ struct BindingRow {
 /// absent. A chord vanishing from this list is indistinguishable from one
 /// that was never there, so someone hunting a shortcut that stopped working
 /// would get no hint that their own config is what removed it.
-fn effective_binding_rows(overrides: &BTreeMap<String, String>) -> Vec<BindingRow> {
+pub fn effective_binding_rows(overrides: &BTreeMap<String, String>) -> Vec<BindingRow> {
     let defaults = router::Keymap::terminator_defaults();
     let mut effective = router::Keymap::terminator_defaults();
     effective.apply_overrides(overrides);
@@ -183,16 +176,11 @@ pub struct UiRequest {
     /// close button, which acts directly through `Graphics::close_button_at`
     /// instead of round-tripping through a request.
     pub close_pane: Option<PaneId>,
-    /// The settings panel's Save button was clicked, carrying the fully
-    /// resolved config that was just written to disk — `Graphics` applies
-    /// it live (same as it's already been doing for the in-progress
-    /// preview) and remembers it as the new "last saved" baseline to
-    /// revert to on a future Cancel.
-    pub settings_saved: Option<config::Config>,
-    /// The settings panel was closed *without* saving — Cancel, or the
-    /// window's own close button — so whatever was being live-previewed
-    /// should revert to the last saved config.
-    pub settings_cancelled: bool,
+    /// The context menu's "Settings..." was clicked. Opening the window
+    /// itself needs an `ActiveEventLoop`, which only the event handler
+    /// has, so this travels back up to `main` rather than being acted on
+    /// where it is raised.
+    pub open_settings: bool,
     /// The user approved a paste that had been held for confirmation —
     /// carries the exact text that was shown in the prompt.
     pub confirm_paste: Option<(PaneId, String)>,
@@ -204,7 +192,7 @@ pub struct UiRequest {
 /// it directly — most widgets below need a plain `&mut f32`/`&mut String`,
 /// and keeping the draft's shape flat avoids threading `&mut
 /// config.appearance.font_size`-style paths through egui widget calls.
-struct SettingsDraft {
+pub struct SettingsDraft {
     theme: String,
     /// Substring the theme list is filtered by. Panel state, not a setting —
     /// there are hundreds of built-in themes, so an unfiltered list is not a
@@ -225,7 +213,7 @@ struct SettingsDraft {
 }
 
 impl SettingsDraft {
-    fn from_config(config: &config::Config) -> Self {
+    pub fn from_config(config: &config::Config) -> Self {
         Self {
             theme: config.appearance.theme.clone(),
             theme_filter: String::new(),
@@ -261,7 +249,7 @@ impl SettingsDraft {
     /// panel doesn't expose (keybinding overrides) passes through
     /// untouched, so saving from the panel can never silently drop a
     /// hand-edited setting the panel has no field for.
-    fn apply_to(&self, base: &config::Config) -> config::Config {
+    pub fn apply_to(&self, base: &config::Config) -> config::Config {
         let mut config = base.clone();
         config.appearance.theme = self.theme.clone();
         match self.background_color {
@@ -300,17 +288,7 @@ fn filtered_themes(filter: &str) -> Vec<&'static str> {
 
 impl Ui {
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, window: &Window) -> Self {
-        let ctx = egui::Context::default();
-        install_chrome_font(&ctx);
-        apply_chrome_style(&ctx);
-        // egui claims Ctrl+Plus/Minus/0 by default and uses them to scale
-        // its own widgets, which is a browser convention, not a terminal
-        // one. In a terminal those chords mean the *font size*, and they're
-        // now bound to it (`router::Action::FontSize`) — leaving egui's
-        // handler on would additionally rescale the chrome behind the
-        // terminal's back, which is what was moving the context menus out
-        // from under the cursor after pressing them.
-        ctx.options_mut(|options| options.zoom_with_keyboard = false);
+        let ctx = chrome_context();
         let state = egui_winit::State::new(ctx.clone(), egui::ViewportId::ROOT, window, None, None, None);
         let renderer = egui_wgpu::Renderer::new(device, format, egui_wgpu::RendererOptions::default());
         Self {
@@ -321,9 +299,7 @@ impl Ui {
             terminal_context_menu: None,
             group_name_input: String::new(),
             swap_shell_input: String::new(),
-            settings_panel: None,
             paste_confirm: None,
-            binding_rows: None,
             repaint_after: std::time::Duration::MAX,
         }
     }
@@ -356,20 +332,7 @@ impl Ui {
 
     /// Whether any menu, panel, or dialog is currently on screen.
     pub fn is_open(&self) -> bool {
-        self.context_menu.is_some()
-            || self.terminal_context_menu.is_some()
-            || self.settings_panel.is_some()
-            || self.paste_confirm.is_some()
-    }
-
-    /// The config that would result from applying the settings panel's
-    /// in-progress edits on top of `base`, if the panel is open — for
-    /// `Graphics::redraw` to render against live, every frame, instead of
-    /// only once Save is clicked. `None` (not just "unchanged") when the
-    /// panel is closed, so the caller can tell "nothing to preview" apart
-    /// from "preview happens to equal the current settings."
-    pub fn live_preview(&self, base: &config::Config) -> Option<config::Config> {
-        self.settings_panel.as_ref().map(|draft| draft.apply_to(base))
+        self.context_menu.is_some() || self.terminal_context_menu.is_some() || self.paste_confirm.is_some()
     }
 
     /// Opens the pane-management context menu for `pane` at `pos` (window
@@ -446,27 +409,11 @@ impl Ui {
         // Moved out of `self` for the duration of the closure below, same
         // reason `close_after` exists: `self.ctx.run_ui` already holds
         // `self.ctx`, so nothing inside the closure can also reach into
-        // `self.settings_panel`/`self.group_name_input` directly. Opening
-        // the settings panel (from the "Settings..." item below) just
-        // assigns into the local, which the render code right after it in
-        // the same closure picks up immediately — no extra frame of delay
-        // before it appears.
-        let mut settings_draft = self.settings_panel.take();
+        // `self.group_name_input` directly.
         let paste_confirm = self.paste_confirm.take();
         let mut paste_confirm_handled = false;
-        let mut close_settings_panel = false;
         let mut group_name_input = core::mem::take(&mut self.group_name_input);
         let mut swap_shell_input = core::mem::take(&mut self.swap_shell_input);
-
-        // Rebuild the keybinding list only when the overrides it's derived
-        // from actually changed, then move it out for the closure the same
-        // way as everything above. The cache isn't about speed — see the
-        // field's own comment for why recomputing every frame is harmful.
-        if self.binding_rows.as_ref().is_none_or(|(cached, _)| *cached != settings.keybindings) {
-            self.binding_rows = Some((settings.keybindings.clone(), effective_binding_rows(&settings.keybindings)));
-        }
-        let binding_rows = self.binding_rows.take();
-        let rows: &[BindingRow] = binding_rows.as_ref().map_or(&[], |(_, rows)| rows.as_slice());
 
         // `run_ui`, not `begin_pass`/`end_pass`: the latter never sets
         // egui's internal `root_ui_available_rect` (that's only populated
@@ -704,7 +651,7 @@ impl Ui {
                                 // theming every other button in this menu
                                 // already uses.
                                 if ui.button("Settings...").clicked() {
-                                    settings_draft = Some(SettingsDraft::from_config(settings));
+                                    request.open_settings = true;
                                     close_after = true;
                                 }
                             });
@@ -801,444 +748,7 @@ impl Ui {
                         });
                     });
             }
-
-            if let Some(draft) = &mut settings_draft {
-                let mut still_open = true;
-                // Not collapsible: the mockup's panel header is a plain
-                // title, not a section that toggles away — the default
-                // collapse triangle is stock egui window chrome this
-                // design pass otherwise moved away from. `default_width`
-                // matters here beyond cosmetics: left at egui's own
-                // content-fit default, every field below rendered at its
-                // bare intrinsic size (a tiny color swatch, a narrow drag
-                // value) instead of the mockup's wide, aligned field grid —
-                // a real, visible gap a developer screenshot caught.
-                egui::Window::new("Settings")
-                    .collapsible(false)
-                    .resizable(false)
-                    .default_width(420.0)
-                    .open(&mut still_open)
-                    .show(&ctx, |ui| {
-                        // Deliberately *not* `Window::scroll`. That enables
-                        // egui's own built-in scroll area, which is built as
-                        // `ScrollArea::neither().auto_shrink(false)` — the
-                        // `auto_shrink(false)` makes it fill all available
-                        // height instead of fitting its content, so the panel
-                        // stretched to the full window and scrolled with room
-                        // to spare. Our own scroll area below can be configured
-                        // to shrink to content, which is what's wanted.
-                        //
-                        // Recomputed every frame, not just set once via
-                        // `default_width`. `Area::constrain` shrinks a window's
-                        // remembered size to fit when the app window narrows,
-                        // and nothing ever grows it back — so a panel squeezed
-                        // by a narrow window stayed squeezed after the window
-                        // was widened again. Re-asserting the width each frame
-                        // is what the context menus were already doing, which
-                        // is why they never had this problem.
-                        let (panel_width, _) = popup_bounds(&ctx, 420.0);
-                        ui.set_width(panel_width);
-                        // Never taller than the app window it sits in; sized by
-                        // its content below that.
-                        ui.set_max_height(panel_content_height(ctx.content_rect().height()));
-                        // Proportional, not pixel-fixed: a fraction of
-                        // whatever the window's *actual current* width is,
-                        // recomputed every frame, rather than hardcoded
-                        // absolute numbers. The window is resizable again
-                        // (a fixed-size window has no real use for "flex"),
-                        // so this is what keeps the label/control ratio
-                        // looking the same whether the developer drags it
-                        // wider or it renders on a different sized display.
-                        // Reading `available_width()` here — once, at the
-                        // top of the window's own content `Ui`, not nested
-                        // inside a `Grid` cell — is exactly what's safe about
-                        // it: this is a real, already-settled width (the
-                        // window's), unlike the runaway values that came from
-                        // calling it deep inside a `Grid`/`Area` before their
-                        // own size was known.
-                        // Everything, including Save/Cancel, sits inside one
-                        // scroll area. `auto_shrink` vertical means it takes
-                        // exactly its content's height and shows no scrollbar
-                        // until the panel genuinely outgrows the app window;
-                        // horizontal off so it fills the panel's width. Having
-                        // the buttons *inside* it is the point: with them
-                        // outside, an expanded keybinding list grew past the
-                        // bottom and drew straight over them.
-                        egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
-                            let content_width = ui.available_width();
-                            let label_width = (content_width * LABEL_COL_FRACTION).clamp(80.0, 160.0);
-                            let value_width = (content_width - label_width - GRID_COLUMN_GAP).max(80.0);
-
-                            section_header(ui, "Appearance");
-                            egui::Grid::new("settings-appearance").num_columns(2).spacing([GRID_COLUMN_GAP, 9.0]).show(
-                                ui,
-                                |ui| {
-                                    grid_label(ui, "Theme", label_width);
-                                    egui::ComboBox::from_id_salt("theme")
-                                        .width(value_width)
-                                        .selected_text(&draft.theme)
-                                        // egui's default is `CloseOnClick`,
-                                        // which means *any* click inside the
-                                        // dropdown shuts it — including the
-                                        // one that puts the caret in the
-                                        // filter field, making the filter
-                                        // impossible to use. Closing is
-                                        // driven explicitly from the list
-                                        // below instead.
-                                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                                        // `show_ui` wraps its body in a
-                                        // ScrollArea of its own, capped at
-                                        // `spacing.combo_height`. Left at
-                                        // that default it sat outside the
-                                        // list's own scroll area and clipped
-                                        // it, so the dropdown had two nested
-                                        // scrollbars: the visible one moved
-                                        // the whole panel a few pixels and
-                                        // the list's real one was cut off.
-                                        // Sized to fit the body so only the
-                                        // list's own scrollbar is ever live.
-                                        .height(theme_list_height(ui) + THEME_LIST_CHROME_HEIGHT)
-                                        .show_ui(ui, |ui| {
-                                            // The filter lives inside the
-                                            // dropdown so it's right where
-                                            // the list is, and resets each
-                                            // time the panel reopens.
-                                            ui.add(
-                                                egui::TextEdit::singleline(&mut draft.theme_filter)
-                                                    .hint_text("Filter…")
-                                                    .desired_width(f32::INFINITY),
-                                            );
-                                            ui.separator();
-
-                                            let names = filtered_themes(&draft.theme_filter);
-                                            if names.is_empty() {
-                                                ui.weak("No matching theme");
-                                            }
-                                            let row_height = theme_row_height(ui);
-                                            egui::ScrollArea::vertical()
-                                                .max_height(theme_list_height(ui))
-                                                // Always the full list
-                                                // height, never shrunk to a
-                                                // short result set: a
-                                                // dropdown that changes
-                                                // height on every keystroke
-                                                // moves the rows out from
-                                                // under the pointer.
-                                                .auto_shrink([false, false])
-                                                .show_rows(ui, row_height, names.len(), |ui, rows| {
-                                                    for name in &names[rows] {
-                                                        let entry = ui.selectable_value(
-                                                            &mut draft.theme,
-                                                            name.to_string(),
-                                                            *name,
-                                                        );
-                                                        if entry.clicked() {
-                                                            ui.close();
-                                                        }
-                                                    }
-                                                });
-                                        });
-                                    ui.end_row();
-
-                                    grid_label(ui, "Font", label_width);
-                                    let selected = if draft.font_family.is_empty() {
-                                        "monospace (system default)"
-                                    } else {
-                                        &draft.font_family
-                                    };
-                                    egui::ComboBox::from_id_salt("font-family")
-                                        .width(value_width)
-                                        .selected_text(selected)
-                                        .show_ui(ui, |ui| {
-                                            ui.selectable_value(
-                                                &mut draft.font_family,
-                                                String::new(),
-                                                "monospace (system default)",
-                                            );
-                                            for name in render::monospace_font_families() {
-                                                ui.selectable_value(
-                                                    &mut draft.font_family,
-                                                    name.clone(),
-                                                    name.as_str(),
-                                                );
-                                            }
-                                        });
-                                    ui.end_row();
-
-                                    grid_label(ui, "Size", label_width);
-                                    slider_field(
-                                        ui,
-                                        value_width,
-                                        egui::Slider::new(
-                                            &mut draft.font_size,
-                                            config::MIN_FONT_SIZE..=config::MAX_FONT_SIZE,
-                                        ),
-                                    );
-                                    ui.end_row();
-
-                                    grid_label(ui, "Ligatures", label_width);
-                                    ui.allocate_ui_with_layout(
-                                        egui::vec2(value_width, ui.spacing().interact_size.y),
-                                        egui::Layout::left_to_right(egui::Align::Center),
-                                        |ui| {
-                                            ui.checkbox(&mut draft.ligatures, "Enable").on_hover_text(LIGATURES_HINT);
-                                        },
-                                    );
-                                    ui.end_row();
-
-                                    grid_label(ui, "Background", label_width);
-                                    ui.allocate_ui_with_layout(
-                                        egui::vec2(value_width, ui.spacing().interact_size.y),
-                                        egui::Layout::left_to_right(egui::Align::Center),
-                                        |ui| {
-                                            let mut follows = draft.background_color.is_none();
-                                            if ui.checkbox(&mut follows, "Follow theme").changed() {
-                                                // Unchecking seeds the picker
-                                                // from the color already on
-                                                // screen, so taking manual
-                                                // control never changes the
-                                                // background by itself.
-                                                draft.background_color =
-                                                    if follows { None } else { Some(draft.effective_background()) };
-                                            }
-                                            if let Some(rgb) = &mut draft.background_color {
-                                                ui.color_edit_button_rgb(rgb);
-                                            } else {
-                                                let mut themed = draft.effective_background();
-                                                ui.add_enabled(false, |ui: &mut egui::Ui| {
-                                                    ui.color_edit_button_rgb(&mut themed)
-                                                });
-                                            }
-                                        },
-                                    );
-                                    ui.end_row();
-
-                                    grid_label(ui, "Accent", label_width);
-                                    color_field(ui, value_width, &mut draft.accent_color);
-                                    ui.end_row();
-
-                                    grid_label(ui, "Title bar", label_width);
-                                    color_field(ui, value_width, &mut draft.title_bar_color);
-                                    ui.end_row();
-                                },
-                            );
-
-                            ui.separator();
-                            section_header(ui, "Terminal");
-                            egui::Grid::new("settings-terminal").num_columns(2).spacing([GRID_COLUMN_GAP, 9.0]).show(
-                                ui,
-                                |ui| {
-                                    grid_label(ui, "Transparency", label_width);
-                                    // Disabled, not hidden, on WSL: the setting still
-                                    // saves and applies normally on the platforms that
-                                    // actually support it (Windows, native Linux) —
-                                    // WSLg's compositor doesn't handle real window
-                                    // transparency correctly (see `platform::is_wsl`'s
-                                    // doc comment), and WSL isn't a target platform
-                                    // here, just a dev environment, so this is
-                                    // disabled outright rather than left to silently
-                                    // do nothing when dragged.
-                                    ui.add_enabled_ui(!crate::platform::is_wsl(), |ui| {
-                                        slider_field(
-                                            ui,
-                                            value_width,
-                                            egui::Slider::new(&mut draft.transparency, 0..=config::MAX_TRANSPARENCY)
-                                                .suffix("%"),
-                                        );
-                                    });
-                                    ui.end_row();
-
-                                    grid_label(ui, "Scrollback", label_width);
-                                    field_box(ui, value_width, |ui| {
-                                        ui.add(
-                                            egui::DragValue::new(&mut draft.scrollback_lines)
-                                                .range(0..=1_000_000usize)
-                                                .suffix(" lines"),
-                                        );
-                                    });
-                                    ui.end_row();
-
-                                    grid_label(ui, "Cursor", label_width);
-                                    // A stretched segmented control (`ui.columns` +
-                                    // `add_sized`), not a plain `ui.horizontal` of
-                                    // `selectable_value`s — matching the mockup's
-                                    // `.segmented` row, whose three buttons use
-                                    // `flex: 1` to fill the full column width instead
-                                    // of shrinking to their own label text.
-                                    let mut clicked_style = None;
-                                    ui.columns(3, |cols| {
-                                        for (col, (style, label)) in cols.iter_mut().zip([
-                                            (config::CursorStyle::Block, "Block"),
-                                            (config::CursorStyle::Underline, "Underline"),
-                                            (config::CursorStyle::Beam, "Beam"),
-                                        ]) {
-                                            let selected = draft.cursor_style == style;
-                                            if col
-                                                .add_sized(
-                                                    [col.available_width(), 0.0],
-                                                    egui::Button::selectable(selected, label),
-                                                )
-                                                .clicked()
-                                            {
-                                                clicked_style = Some(style);
-                                            }
-                                        }
-                                    });
-                                    if let Some(style) = clicked_style {
-                                        draft.cursor_style = style;
-                                    }
-                                    ui.end_row();
-                                },
-                            );
-                            if crate::platform::is_wsl() {
-                                ui.weak("Transparency isn't supported under WSL.");
-                            }
-
-                            ui.separator();
-                            section_header(ui, "Shell");
-                            egui::Grid::new("settings-shell").num_columns(2).spacing([GRID_COLUMN_GAP, 9.0]).show(
-                                ui,
-                                |ui| {
-                                    grid_label(ui, "Default", label_width);
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut draft.default_shell)
-                                            .hint_text("(platform default)")
-                                            .desired_width(value_width),
-                                    );
-                                    ui.end_row();
-                                },
-                            );
-                            // Windows-only: unlike Linux/macOS (one obvious choice
-                            // — whatever `$SHELL`/the OS already has configured,
-                            // which leaving this field empty already picks up),
-                            // Windows has no single obvious default shell — cmd,
-                            // Windows PowerShell, and WSL are all common, equally
-                            // reasonable choices, and typing an exact executable
-                            // name/path into the field above is real friction
-                            // compared to picking one. These just fill that field
-                            // in; the field itself still takes any custom value (a
-                            // specific WSL distro invocation, `pwsh.exe`, ...).
-                            //
-                            // A full-width row below the grid, not a third grid
-                            // row: the mockup's own `.quick-picks` sits outside
-                            // `.field-grid` as its own sibling, spanning the whole
-                            // section instead of being squeezed into just the
-                            // value column — confirmed by re-reading the mockup's
-                            // HTML directly rather than assuming.
-                            #[cfg(target_os = "windows")]
-                            {
-                                ui.add_space(2.0);
-                                ui.columns(3, |cols| {
-                                    if cols[0]
-                                        .add_sized(
-                                            [cols[0].available_width(), 0.0],
-                                            egui::Button::new("Command Prompt"),
-                                        )
-                                        .clicked()
-                                    {
-                                        draft.default_shell = "cmd.exe".to_string();
-                                    }
-                                    if cols[1]
-                                        .add_sized([cols[1].available_width(), 0.0], egui::Button::new("PowerShell"))
-                                        .clicked()
-                                    {
-                                        draft.default_shell = "powershell.exe".to_string();
-                                    }
-                                    if cols[2]
-                                        .add_sized([cols[2].available_width(), 0.0], egui::Button::new("WSL"))
-                                        .clicked()
-                                    {
-                                        draft.default_shell = "wsl.exe".to_string();
-                                    }
-                                });
-                            }
-
-                            ui.separator();
-                            section_header(ui, "Keybindings");
-                            // Read-only: hand-edit `config.toml`'s `[keybindings]`
-                            // to change these (Milestone 5.3) — remapping chords
-                            // from inside the panel is future polish, not something
-                            // 5.4's own acceptance criteria call for.
-                            //
-                            // Lists what's *in effect*, defaults included, rather
-                            // than only the overrides. Showing overrides alone made
-                            // this section useless to the people most likely to
-                            // open it: someone who has never edited the config sees
-                            // an empty box telling them defaults exist, without
-                            // saying what any of them are.
-                            ui.weak("Edit [keybindings] in config.toml to change these.");
-                            ui.add_space(2.0);
-                            // Collapsed by default, and never scrolled: the list is
-                            // long, but it's reference material nobody needs open
-                            // while changing a font size. Folding it away keeps the
-                            // panel short enough to render whole, which a scrolling
-                            // sub-region never managed — and when it is open it's
-                            // read top to bottom, so a viewport showing six rows at
-                            // a time is worse than simply being tall.
-                            egui::CollapsingHeader::new("Show all keybindings")
-                                .id_salt("keybindings-list")
-                                .default_open(false)
-                                .show(ui, |ui| {
-                                    ui.set_width(ui.available_width());
-                                    // Two columns, no header and no borders:
-                                    // the pairing is what an aligned column
-                                    // already says, so the arrow that used to
-                                    // sit between chord and action was one
-                                    // more symbol to interpret and nothing
-                                    // more.
-                                    egui::Grid::new("keybindings-list-grid")
-                                        .num_columns(2)
-                                        .spacing([GRID_COLUMN_GAP, 4.0])
-                                        .show(ui, |ui| {
-                                            for row in rows {
-                                                let chords = row.chords.join(", ");
-                                                if row.custom {
-                                                    ui.label(chords);
-                                                    ui.label(format!("{}   (custom)", row.action));
-                                                } else {
-                                                    ui.weak(chords);
-                                                    ui.weak(&row.action);
-                                                }
-                                                ui.end_row();
-                                            }
-                                        });
-                                });
-                            ui.separator();
-                            // `right_to_left`: the mockup's action row is flush
-                            // against the panel's right edge (Cancel, then Save
-                            // at the very edge), not left-packed like a plain
-                            // `ui.horizontal` would render it — the first widget
-                            // added under `right_to_left` lands rightmost, so Save
-                            // is added first here despite reading second on
-                            // screen.
-                            action_row(ui, |ui| {
-                                if ui.button("Save").clicked() {
-                                    let new_config = draft.apply_to(settings);
-                                    if let Err(err) = new_config.save(&config::Config::default_path()) {
-                                        eprintln!("config: failed to save settings: {err:#}");
-                                    }
-                                    request.settings_saved = Some(new_config);
-                                    close_settings_panel = true;
-                                }
-                                if ui.button("Cancel").clicked() {
-                                    request.settings_cancelled = true;
-                                    close_settings_panel = true;
-                                }
-                            });
-                        });
-                    });
-                if !still_open {
-                    // The window's own close button, not either of our
-                    // two — same as Cancel: closed without an explicit
-                    // Save, so whatever was being live-previewed should
-                    // revert.
-                    request.settings_cancelled = true;
-                    close_settings_panel = true;
-                }
-            }
         });
-
-        self.binding_rows = binding_rows;
 
         if close_after {
             self.context_menu = None;
@@ -1251,7 +761,6 @@ impl Ui {
         if close_terminal_after {
             self.terminal_context_menu = None;
         }
-        self.settings_panel = if close_settings_panel { None } else { settings_draft };
         if !paste_confirm_handled {
             self.paste_confirm = paste_confirm;
         }
@@ -1332,6 +841,30 @@ impl Ui {
 /// found, this silently leaves egui's own default in place rather than
 /// erroring: a slightly-less-native font is a fine outcome, a blank/broken
 /// one from a bad font load is not.
+/// An `egui::Context` set up the way every window in this app wants one:
+/// this project's chrome font and style, and egui's own keyboard-zoom
+/// handler turned off.
+///
+/// Shared rather than repeated per window, because each of those is a
+/// non-default that had to be discovered the hard way, and a second
+/// context that quietly missed one would fail in a way nobody would
+/// connect back to here — a settings window whose widgets rescale on
+/// Ctrl+Plus while the terminal's font stays put, say.
+pub fn chrome_context() -> egui::Context {
+    let ctx = egui::Context::default();
+    install_chrome_font(&ctx);
+    apply_chrome_style(&ctx);
+    // egui claims Ctrl+Plus/Minus/0 by default and uses them to scale its
+    // own widgets, which is a browser convention, not a terminal one. In a
+    // terminal those chords mean the *font size*, and they are bound to it
+    // (`router::Action::FontSize`) — leaving egui's handler on would
+    // additionally rescale the chrome behind the terminal's back, which is
+    // what was moving the context menus out from under the cursor after
+    // pressing them.
+    ctx.options_mut(|options| options.zoom_with_keyboard = false);
+    ctx
+}
+
 fn install_chrome_font(ctx: &egui::Context) {
     let Some((bytes, index)) = render::system_ui_font_data() else { return };
     let mut fonts = egui::FontDefinitions::default();
@@ -1356,6 +889,10 @@ const RADIUS: u8 = 2;
 // piece of this palette that isn't a fixed constant (Settings' "Accent
 // color" instead), so it stays a `graphite_visuals` parameter.
 const PANEL_BG: egui::Color32 = egui::Color32::from_rgb(0x14, 0x17, 0x1b); // graphics.rs's TITLE_BAR_BG
+/// The same color as 0.0-1.0 sRGB, for the settings window's clear value —
+/// which is a GPU clear rather than an egui fill and so needs the number,
+/// not the `Color32`.
+pub const PANEL_BG_RGB: [f64; 3] = [0x14 as f64 / 255.0, 0x17 as f64 / 255.0, 0x1b as f64 / 255.0];
 const FIELD_BG: egui::Color32 = egui::Color32::from_rgb(0x1b, 0x1f, 0x24); // one step up from PANEL_BG
 const BORDER: egui::Color32 = egui::Color32::from_rgb(0x26, 0x2b, 0x31); // graphics.rs's DIVIDER_COLOR
 const INK: egui::Color32 = egui::Color32::from_rgb(0xdf, 0xe2, 0xe6); // graphics.rs's TEXT_COLOR
@@ -1639,7 +1176,7 @@ const SCROLLBAR_GUTTER: f32 = 4.0;
 /// settings panel — so it matches the terminal grid's own colors instead of
 /// egui's stock dark theme. `accent` is the one user-configurable piece
 /// (Settings' "Accent color"); the rest is the fixed palette above.
-fn graphite_visuals(accent_rgb: [f32; 3]) -> egui::Visuals {
+pub fn graphite_visuals(accent_rgb: [f32; 3]) -> egui::Visuals {
     let accent = color32_from_rgb(accent_rgb);
     let panel_bg = PANEL_BG;
     let field_bg = FIELD_BG;
@@ -1708,6 +1245,348 @@ fn graphite_visuals(accent_rgb: [f32; 3]) -> egui::Visuals {
     visuals.slider_trailing_fill = true;
 
     visuals
+}
+
+/// What the settings window's own buttons asked for this frame.
+#[derive(Default)]
+pub struct SettingsOutcome {
+    /// Save was clicked, carrying the config that was just written to disk.
+    pub saved: Option<config::Config>,
+    /// Cancel was clicked — whatever was being live-previewed should revert.
+    pub cancelled: bool,
+}
+
+/// Draws the settings form into `ui`.
+///
+/// Takes a plain `&mut Ui` rather than owning a window, because it no
+/// longer draws into one: the panel is its own OS window now
+/// (`crate::settings_window`), which supplies the frame, the title bar and
+/// the size. It stays here, beside the widget helpers and the draft type it
+/// is built from, rather than moving wholesale into that module.
+pub fn settings_panel(
+    ui: &mut egui::Ui,
+    draft: &mut SettingsDraft,
+    settings: &config::Config,
+    binding_rows: &[BindingRow],
+) -> SettingsOutcome {
+    let mut outcome = SettingsOutcome::default();
+    // Everything, including Save/Cancel, sits inside one scroll area.
+    // `auto_shrink` vertical means it takes exactly its content's height
+    // and shows no scrollbar until the form genuinely outgrows the window;
+    // horizontal off so it fills the width. Having the buttons *inside* it
+    // is the point: with them outside, an expanded keybinding list grew
+    // past the bottom and drew straight over them.
+    //
+    // The column widths below are proportional rather than fixed, read
+    // once from `available_width` at the top of this `Ui` — a real,
+    // already-settled width, unlike the runaway values that come from
+    // asking deep inside a `Grid` before its own size is known. That keeps
+    // the label/control ratio steady as the window is resized.
+    egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
+        let content_width = ui.available_width();
+        let label_width = (content_width * LABEL_COL_FRACTION).clamp(80.0, 160.0);
+        let value_width = (content_width - label_width - GRID_COLUMN_GAP).max(80.0);
+
+        section_header(ui, "Appearance");
+        egui::Grid::new("settings-appearance").num_columns(2).spacing([GRID_COLUMN_GAP, 9.0]).show(ui, |ui| {
+            grid_label(ui, "Theme", label_width);
+            egui::ComboBox::from_id_salt("theme")
+                .width(value_width)
+                .selected_text(&draft.theme)
+                // egui's default is `CloseOnClick`,
+                // which means *any* click inside the
+                // dropdown shuts it — including the
+                // one that puts the caret in the
+                // filter field, making the filter
+                // impossible to use. Closing is
+                // driven explicitly from the list
+                // below instead.
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                // `show_ui` wraps its body in a
+                // ScrollArea of its own, capped at
+                // `spacing.combo_height`. Left at
+                // that default it sat outside the
+                // list's own scroll area and clipped
+                // it, so the dropdown had two nested
+                // scrollbars: the visible one moved
+                // the whole panel a few pixels and
+                // the list's real one was cut off.
+                // Sized to fit the body so only the
+                // list's own scrollbar is ever live.
+                .height(theme_list_height(ui) + THEME_LIST_CHROME_HEIGHT)
+                .show_ui(ui, |ui| {
+                    // The filter lives inside the
+                    // dropdown so it's right where
+                    // the list is, and resets each
+                    // time the panel reopens.
+                    ui.add(
+                        egui::TextEdit::singleline(&mut draft.theme_filter)
+                            .hint_text("Filter…")
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.separator();
+
+                    let names = filtered_themes(&draft.theme_filter);
+                    if names.is_empty() {
+                        ui.weak("No matching theme");
+                    }
+                    let row_height = theme_row_height(ui);
+                    egui::ScrollArea::vertical()
+                        .max_height(theme_list_height(ui))
+                        // Always the full list
+                        // height, never shrunk to a
+                        // short result set: a
+                        // dropdown that changes
+                        // height on every keystroke
+                        // moves the rows out from
+                        // under the pointer.
+                        .auto_shrink([false, false])
+                        .show_rows(ui, row_height, names.len(), |ui, rows| {
+                            for name in &names[rows] {
+                                let entry = ui.selectable_value(&mut draft.theme, name.to_string(), *name);
+                                if entry.clicked() {
+                                    ui.close();
+                                }
+                            }
+                        });
+                });
+            ui.end_row();
+
+            grid_label(ui, "Font", label_width);
+            let selected = if draft.font_family.is_empty() { "monospace (system default)" } else { &draft.font_family };
+            egui::ComboBox::from_id_salt("font-family").width(value_width).selected_text(selected).show_ui(ui, |ui| {
+                ui.selectable_value(&mut draft.font_family, String::new(), "monospace (system default)");
+                for name in render::monospace_font_families() {
+                    ui.selectable_value(&mut draft.font_family, name.clone(), name.as_str());
+                }
+            });
+            ui.end_row();
+
+            grid_label(ui, "Size", label_width);
+            slider_field(
+                ui,
+                value_width,
+                egui::Slider::new(&mut draft.font_size, config::MIN_FONT_SIZE..=config::MAX_FONT_SIZE),
+            );
+            ui.end_row();
+
+            grid_label(ui, "Ligatures", label_width);
+            ui.allocate_ui_with_layout(
+                egui::vec2(value_width, ui.spacing().interact_size.y),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.checkbox(&mut draft.ligatures, "Enable").on_hover_text(LIGATURES_HINT);
+                },
+            );
+            ui.end_row();
+
+            grid_label(ui, "Background", label_width);
+            ui.allocate_ui_with_layout(
+                egui::vec2(value_width, ui.spacing().interact_size.y),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    let mut follows = draft.background_color.is_none();
+                    if ui.checkbox(&mut follows, "Follow theme").changed() {
+                        // Unchecking seeds the picker
+                        // from the color already on
+                        // screen, so taking manual
+                        // control never changes the
+                        // background by itself.
+                        draft.background_color = if follows { None } else { Some(draft.effective_background()) };
+                    }
+                    if let Some(rgb) = &mut draft.background_color {
+                        ui.color_edit_button_rgb(rgb);
+                    } else {
+                        let mut themed = draft.effective_background();
+                        ui.add_enabled(false, |ui: &mut egui::Ui| ui.color_edit_button_rgb(&mut themed));
+                    }
+                },
+            );
+            ui.end_row();
+
+            grid_label(ui, "Accent", label_width);
+            color_field(ui, value_width, &mut draft.accent_color);
+            ui.end_row();
+
+            grid_label(ui, "Title bar", label_width);
+            color_field(ui, value_width, &mut draft.title_bar_color);
+            ui.end_row();
+        });
+
+        ui.separator();
+        section_header(ui, "Terminal");
+        egui::Grid::new("settings-terminal").num_columns(2).spacing([GRID_COLUMN_GAP, 9.0]).show(ui, |ui| {
+            grid_label(ui, "Transparency", label_width);
+            // Disabled, not hidden, on WSL: the setting still
+            // saves and applies normally on the platforms that
+            // actually support it (Windows, native Linux) —
+            // WSLg's compositor doesn't handle real window
+            // transparency correctly (see `platform::is_wsl`'s
+            // doc comment), and WSL isn't a target platform
+            // here, just a dev environment, so this is
+            // disabled outright rather than left to silently
+            // do nothing when dragged.
+            ui.add_enabled_ui(!crate::platform::is_wsl(), |ui| {
+                slider_field(
+                    ui,
+                    value_width,
+                    egui::Slider::new(&mut draft.transparency, 0..=config::MAX_TRANSPARENCY).suffix("%"),
+                );
+            });
+            ui.end_row();
+
+            grid_label(ui, "Scrollback", label_width);
+            field_box(ui, value_width, |ui| {
+                ui.add(egui::DragValue::new(&mut draft.scrollback_lines).range(0..=1_000_000usize).suffix(" lines"));
+            });
+            ui.end_row();
+
+            grid_label(ui, "Cursor", label_width);
+            // A stretched segmented control (`ui.columns` +
+            // `add_sized`), not a plain `ui.horizontal` of
+            // `selectable_value`s — matching the mockup's
+            // `.segmented` row, whose three buttons use
+            // `flex: 1` to fill the full column width instead
+            // of shrinking to their own label text.
+            let mut clicked_style = None;
+            ui.columns(3, |cols| {
+                for (col, (style, label)) in cols.iter_mut().zip([
+                    (config::CursorStyle::Block, "Block"),
+                    (config::CursorStyle::Underline, "Underline"),
+                    (config::CursorStyle::Beam, "Beam"),
+                ]) {
+                    let selected = draft.cursor_style == style;
+                    if col.add_sized([col.available_width(), 0.0], egui::Button::selectable(selected, label)).clicked()
+                    {
+                        clicked_style = Some(style);
+                    }
+                }
+            });
+            if let Some(style) = clicked_style {
+                draft.cursor_style = style;
+            }
+            ui.end_row();
+        });
+        if crate::platform::is_wsl() {
+            ui.weak("Transparency isn't supported under WSL.");
+        }
+
+        ui.separator();
+        section_header(ui, "Shell");
+        egui::Grid::new("settings-shell").num_columns(2).spacing([GRID_COLUMN_GAP, 9.0]).show(ui, |ui| {
+            grid_label(ui, "Default", label_width);
+            ui.add(
+                egui::TextEdit::singleline(&mut draft.default_shell)
+                    .hint_text("(platform default)")
+                    .desired_width(value_width),
+            );
+            ui.end_row();
+        });
+        // Windows-only: unlike Linux/macOS (one obvious choice
+        // — whatever `$SHELL`/the OS already has configured,
+        // which leaving this field empty already picks up),
+        // Windows has no single obvious default shell — cmd,
+        // Windows PowerShell, and WSL are all common, equally
+        // reasonable choices, and typing an exact executable
+        // name/path into the field above is real friction
+        // compared to picking one. These just fill that field
+        // in; the field itself still takes any custom value (a
+        // specific WSL distro invocation, `pwsh.exe`, ...).
+        //
+        // A full-width row below the grid, not a third grid
+        // row: the mockup's own `.quick-picks` sits outside
+        // `.field-grid` as its own sibling, spanning the whole
+        // section instead of being squeezed into just the
+        // value column — confirmed by re-reading the mockup's
+        // HTML directly rather than assuming.
+        #[cfg(target_os = "windows")]
+        {
+            ui.add_space(2.0);
+            ui.columns(3, |cols| {
+                if cols[0].add_sized([cols[0].available_width(), 0.0], egui::Button::new("Command Prompt")).clicked() {
+                    draft.default_shell = "cmd.exe".to_string();
+                }
+                if cols[1].add_sized([cols[1].available_width(), 0.0], egui::Button::new("PowerShell")).clicked() {
+                    draft.default_shell = "powershell.exe".to_string();
+                }
+                if cols[2].add_sized([cols[2].available_width(), 0.0], egui::Button::new("WSL")).clicked() {
+                    draft.default_shell = "wsl.exe".to_string();
+                }
+            });
+        }
+
+        ui.separator();
+        section_header(ui, "Keybindings");
+        // Read-only: hand-edit `config.toml`'s `[keybindings]`
+        // to change these (Milestone 5.3) — remapping chords
+        // from inside the panel is future polish, not something
+        // 5.4's own acceptance criteria call for.
+        //
+        // Lists what's *in effect*, defaults included, rather
+        // than only the overrides. Showing overrides alone made
+        // this section useless to the people most likely to
+        // open it: someone who has never edited the config sees
+        // an empty box telling them defaults exist, without
+        // saying what any of them are.
+        ui.weak("Edit [keybindings] in config.toml to change these.");
+        ui.add_space(2.0);
+        // Collapsed by default, and never scrolled: the list is
+        // long, but it's reference material nobody needs open
+        // while changing a font size. Folding it away keeps the
+        // panel short enough to render whole, which a scrolling
+        // sub-region never managed — and when it is open it's
+        // read top to bottom, so a viewport showing six rows at
+        // a time is worse than simply being tall.
+        egui::CollapsingHeader::new("Show all keybindings").id_salt("keybindings-list").default_open(false).show(
+            ui,
+            |ui| {
+                ui.set_width(ui.available_width());
+                // Two columns, no header and no borders:
+                // the pairing is what an aligned column
+                // already says, so the arrow that used to
+                // sit between chord and action was one
+                // more symbol to interpret and nothing
+                // more.
+                egui::Grid::new("keybindings-list-grid").num_columns(2).spacing([GRID_COLUMN_GAP, 4.0]).show(
+                    ui,
+                    |ui| {
+                        for row in binding_rows {
+                            let chords = row.chords.join(", ");
+                            if row.custom {
+                                ui.label(chords);
+                                ui.label(format!("{}   (custom)", row.action));
+                            } else {
+                                ui.weak(chords);
+                                ui.weak(&row.action);
+                            }
+                            ui.end_row();
+                        }
+                    },
+                );
+            },
+        );
+        ui.separator();
+        // `right_to_left`: the mockup's action row is flush
+        // against the panel's right edge (Cancel, then Save
+        // at the very edge), not left-packed like a plain
+        // `ui.horizontal` would render it — the first widget
+        // added under `right_to_left` lands rightmost, so Save
+        // is added first here despite reading second on
+        // screen.
+        action_row(ui, |ui| {
+            if ui.button("Save").clicked() {
+                let new_config = draft.apply_to(settings);
+                if let Err(err) = new_config.save(&config::Config::default_path()) {
+                    eprintln!("config: failed to save settings: {err:#}");
+                }
+                outcome.saved = Some(new_config);
+            }
+            if ui.button("Cancel").clicked() {
+                outcome.cancelled = true;
+            }
+        });
+    });
+    outcome
 }
 
 #[cfg(test)]

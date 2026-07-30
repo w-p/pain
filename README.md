@@ -185,6 +185,9 @@ chord can't carry.
 | Right-click a terminal | Terminal menu: copy, paste, close |
 | Scroll wheel | Scroll back through that pane's history |
 
+Settings opens in its own window, so it can be moved anywhere — including
+onto another monitor — rather than being confined to the terminal window.
+
 `Shift+click` is the standard escape hatch for selecting text inside
 full-screen programs like vim or htop, which would otherwise eat the click.
 
@@ -223,7 +226,7 @@ Settings live in a TOML file, read at startup and re-read when it changes:
 | Windows | `%APPDATA%\pain\config.toml` |
 
 `pain --help` prints the resolved path for the machine you're on. The file
-doesn't exist until you save settings from the settings panel or create it
+doesn't exist until you save settings from the settings window or create it
 yourself, and every key is optional — a partial file is valid, and anything
 missing uses its default.
 
