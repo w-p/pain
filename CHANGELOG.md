@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.11.0
+
 - Retro eras, off by default. An era is a period look for a specific machine —
   `green` (IBM 5151), `amber`, `cga` (IBM 5153), `bbs`, `c64` — bundling a
   palette, scanlines, a curved-glass vignette, and a typeface. Set `[retro]
