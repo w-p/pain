@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.10.0
+
 - The process scan behind the pane title bars now collects only what those
   titles actually read (a process's name, parent, and start time). It had
   been collecting memory and CPU counters, disk I/O, and the thread list of
