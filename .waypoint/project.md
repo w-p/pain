@@ -92,6 +92,19 @@ whole file and silently revert every unrelated setting in it.
 v1.8.0 is marked pre-release with a warning note. It remains in the APT
 repo on `gh-pages`, which marking the GitHub release does not touch.
 
+**v1.10.0 (2026-07-29): settings in its own OS window** (see
+`.waypoint/features/settings-window.md` — a second winit window and egui
+context over the shared wgpu device; `Graphics` retains the
+`Instance`/`Adapter` for it, and `ui::chrome_context()` builds both egui
+contexts so no per-context override can be missed). Also: the title-bar
+process scan trimmed to base fields only (`ProcessRefreshKind::nothing()`
+— the default shorthand was collecting every process's thread list and
+I/O counters twice a second). A Debian user's 100MB+ memory report was
+investigated and attributed: ~19MB app heap, the rest GPU-driver/swapchain
+baseline plus usage-proportional scrollback; full breakdown in the memory
+log. Settings window not yet verified on real hardware at release time —
+developer chose to ship and test from the release.
+
 **Distribution is fully automated.** Pushing a `v*` tag runs
 `.github/workflows/release.yml`, which builds four targets, publishes a
 GitHub Release with notes taken verbatim from `CHANGELOG.md`'s matching

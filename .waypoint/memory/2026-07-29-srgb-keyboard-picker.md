@@ -369,3 +369,46 @@ platform-specific feature that never verifiably worked.
 v1.8.0 marked **pre-release** with a warning note pointing at v1.9.0 and
 explaining the detection. Left published rather than deleted; note that
 this does *not* remove it from the APT repo on `gh-pages`.
+
+---
+
+## Memory investigation (reports of 100MB+ on Windows)
+
+Measured here first (WSL, llvmpipe — numbers carry that caveat):
+RSS 200MB, of which **the app's own heap is 19MB** and stays flat. The
+other ~180MB is the rendering stack: libLLVM+llvmpipe code pages (~65MB),
+the AMD WSL driver's mapped files (~35MB), and anonymous GPU-buffer
+mappings (llvmpipe renders in system RAM). On real Windows the equivalent
+is the D3D12 driver + DirectComposition swapchain — a maximized 4K window
+is ~33MB *per swapchain buffer*, × 3 buffers. GPU-rendered terminals
+(WezTerm, Ghostty, Windows Terminal) all pay this; GDI/older ones don't.
+
+**One real defect found and fixed:** `ForegroundProcesses` used
+`System::refresh_processes`, which is shorthand for a refresh kind that
+collects memory+CPU counters, per-process disk-I/O, exe path, and the
+entire *thread list* of every process on the system, every 500ms, retained
+in the map — to serve a title bar that reads three base fields (name,
+parent, start_time). Now `ProcessRefreshKind::nothing()`; the base fields
+are always collected (verified in sysinfo 0.39.6 source, and the 11
+foreground tests exercise real name/parent/start_time lookups through the
+restricted scan). Measured **neutral on this quiet sandbox** (~30
+processes); expected to matter on a busy Windows desktop (300+ processes,
+per-process handle opens for I/O counters). Claim honestly: strictly less
+work and less retained data, not "the 100MB".
+
+**Checked and deliberately not changed:**
+- Scrollback: `alacritty_terminal`'s Storage allocates visible lines only
+  and grows in 1000-row chunks as history fills (verified in source).
+  Fully-scrolled pane ≈ 24B/cell → ~14MB at 120 cols × 5000 lines. Our
+  default (5000) is already half of Alacritty's own (10000). Inherent,
+  usage-proportional, same in kind as every terminal.
+- Per-frame Vec churn (rects/glyphs): transient, allocator reuses.
+- Shape cache: capped (SHAPE_CACHE_LIMIT), dropped on font change.
+- Atlases: 2048² R8 + 1024² RGBA = 8MB GPU total, fixed.
+- egui: second context only exists while the settings window is open,
+  fully dropped on close.
+
+**The likely truth of the report:** baseline working set of any wgpu/DX12
+app (driver + 3 swapchain buffers, scaling with window size) plus filled
+scrollback. Worth asking the reporter for window size/resolution and
+whether it grows unboundedly over time (a leak) or plateaus (the above).

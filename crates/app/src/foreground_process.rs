@@ -40,6 +40,23 @@ use std::time::{Duration, Instant};
 
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
+/// What the periodic scan actually collects: nothing beyond the base
+/// fields (name, parent pid, start time), which sysinfo always fills in
+/// for every process it enumerates.
+///
+/// This matters more than it looks. `System::refresh_processes` — the
+/// obvious call, and what this module used — is shorthand for a refresh
+/// kind that also collects memory and CPU counters, per-process disk-I/O,
+/// the executable path, and the *entire thread list* of every process on
+/// the system, and retains all of it in the process map. Repeated every
+/// 500ms for the lifetime of the app, that was megabytes of permanently
+/// resident strings and counters (and on Windows, per-process handle
+/// opens and I/O-counter queries) in service of a title bar that reads
+/// three fields.
+fn scan_kind() -> ProcessRefreshKind {
+    ProcessRefreshKind::nothing()
+}
+
 /// How often to re-scan the process list. Enumeration touches every
 /// process on the system, not just the ones any one pane cares about —
 /// cheap per call, but wasteful to repeat every single frame across every
@@ -57,7 +74,7 @@ pub struct ForegroundProcesses {
 impl ForegroundProcesses {
     pub fn new() -> Self {
         let mut system = System::new();
-        system.refresh_processes(ProcessesToUpdate::All, true);
+        system.refresh_processes_specifics(ProcessesToUpdate::All, true, scan_kind());
         Self { system, last_refresh: Instant::now() }
     }
 
@@ -75,7 +92,7 @@ impl ForegroundProcesses {
 
     pub fn maybe_refresh(&mut self) -> bool {
         if self.last_refresh.elapsed() >= REFRESH_INTERVAL {
-            self.system.refresh_processes(ProcessesToUpdate::All, true);
+            self.system.refresh_processes_specifics(ProcessesToUpdate::All, true, scan_kind());
             self.last_refresh = Instant::now();
             true
         } else {
@@ -195,7 +212,7 @@ mod tests {
             std::process::Command::new("sleep").arg("5").spawn().expect("spawn a real child process to look up");
 
         let mut processes = ForegroundProcesses::new();
-        processes.system.refresh_processes(ProcessesToUpdate::All, true);
+        processes.system.refresh_processes_specifics(ProcessesToUpdate::All, true, scan_kind());
 
         assert_eq!(processes.name_for(Some(child.id()), None).as_deref(), Some("sleep"));
 
@@ -211,7 +228,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(50));
 
         let mut processes = ForegroundProcesses::new();
-        processes.system.refresh_processes(ProcessesToUpdate::All, true);
+        processes.system.refresh_processes_specifics(ProcessesToUpdate::All, true, scan_kind());
 
         let name = processes.name_for(Some(shell_stand_in.id()), Some(foreground_stand_in.id()));
         assert_eq!(name.as_deref(), Some("cat"));
@@ -249,7 +266,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(300));
 
         let mut processes = ForegroundProcesses::new();
-        processes.system.refresh_processes(ProcessesToUpdate::All, true);
+        processes.system.refresh_processes_specifics(ProcessesToUpdate::All, true, scan_kind());
 
         let name = processes.name_for(pty.shell_pid(), pty.foreground_pgid());
         assert_eq!(name.as_deref(), Some("sleep"));
@@ -269,7 +286,7 @@ mod tests {
 
         let mut child = std::process::Command::new("sleep").arg("5").spawn().expect("spawn a real child process");
         std::thread::sleep(std::time::Duration::from_millis(50));
-        processes.system.refresh_processes(ProcessesToUpdate::All, true);
+        processes.system.refresh_processes_specifics(ProcessesToUpdate::All, true, scan_kind());
 
         assert_eq!(processes.name_for(Some(child.id()), None).as_deref(), Some("sleep"));
 
@@ -295,7 +312,7 @@ mod tests {
 
         let mut processes = ForegroundProcesses::new();
         for i in 0..20 {
-            processes.system.refresh_processes(ProcessesToUpdate::All, true);
+            processes.system.refresh_processes_specifics(ProcessesToUpdate::All, true, scan_kind());
             let name = processes.name_for(pty.shell_pid(), pty.foreground_pgid());
             assert_eq!(name.as_deref(), Some("htop"), "wrong name on cycle {i}");
             std::thread::sleep(std::time::Duration::from_millis(100));

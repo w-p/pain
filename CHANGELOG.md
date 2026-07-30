@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- The process scan behind the pane title bars now collects only what those
+  titles actually read (a process's name, parent, and start time). It had
+  been collecting memory and CPU counters, disk I/O, and the thread list of
+  every process on the system, every half second, and keeping it all.
+
 - Settings opens in its own window now, rather than as a panel floating
   inside the terminal. It can be dragged anywhere, including onto another
   monitor, and no longer competes with your panes for space or has to be
