@@ -73,6 +73,55 @@ fn scaled_font_size(font_size: u32, scale_factor: f64) -> f32 {
 /// accent changes.
 const BROADCAST_BORDER_COLOR: [f32; 4] = [0.95, 0.6, 0.15, 1.0];
 const BROADCAST_BORDER_THICKNESS: f32 = 3.0;
+/// Resolves one era-backed effect strength to the 0.0–1.0 the shader wants.
+///
+/// Precedence, highest first:
+///
+/// 1. An **explicit** `[retro]` setting. Someone who turned scanlines off
+///    meant it, whichever era they happen to be trying.
+/// 2. A **session era override** (`--era`, or the escape sequence).
+/// 3. Whatever the **config** resolves to, era included.
+///
+/// A free function so this is testable without a GPU: `Graphics` can't be
+/// constructed in a unit test, and the precedence is the part worth pinning.
+fn effect_strength(explicit: Option<u32>, era_override: Option<u32>, configured: u32) -> f32 {
+    let percent = explicit.or(era_override).unwrap_or(configured);
+    percent.min(config::MAX_EFFECT) as f32 / config::MAX_EFFECT as f32
+}
+
+/// Where the hum bar sits after `elapsed`, as a 0.0–1.0 phase that wraps.
+///
+/// A free function so the wrapping is testable without a GPU — and because
+/// getting it wrong is invisible until someone leaves a terminal open long
+/// enough for `f32` precision to matter.
+fn hum_phase(elapsed: std::time::Duration, period: std::time::Duration) -> f32 {
+    if period.is_zero() {
+        return 0.0;
+    }
+    (elapsed.as_secs_f64() % period.as_secs_f64() / period.as_secs_f64()) as f32
+}
+
+/// How long the hum bar takes to travel the full height of the screen.
+///
+/// A real hum bar drifts at the beat frequency between the mains supply and
+/// the vertical refresh — a fraction of a hertz, so it creeps. Several
+/// seconds per pass is both what that looks like and slow enough not to pull
+/// the eye away from what someone is reading.
+const HUM_PERIOD: std::time::Duration = std::time::Duration::from_secs(9);
+
+/// How often a frame is drawn while the hum bar is animating.
+///
+/// Deliberately far below the display's refresh rate. The bar takes nine
+/// seconds to cross the screen, so twenty frames a second is visually
+/// identical to sixty for it and wakes the GPU a third as often. This is the
+/// only thing in the app that stops an idle terminal sleeping, so it is worth
+/// being stingy with — and it stops entirely when the window loses focus.
+const HUM_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Logical pixels per light/dark scanline cycle, before DPI scaling. Roughly
+/// what a raster line occupied on a CRT at a typical text resolution — small
+/// enough to read as a texture, large enough not to alias into moire.
+const SCANLINE_PERIOD_POINTS: f32 = 3.0;
 /// Ratio delta applied per keyboard resize chord press.
 const RESIZE_STEP: f32 = 0.03;
 
@@ -170,6 +219,24 @@ pub struct Graphics {
     /// holding Ctrl without moving the mouse still lights up the link
     /// under it.
     hovered_url: Option<UrlHover>,
+    /// A retro era set at runtime — by `--era`, or by `pane::retro`'s escape
+    /// sequence — overriding `settings.retro.era` for this session only.
+    ///
+    /// Deliberately separate from `settings` rather than written into it: the
+    /// settings panel saves from `settings`, so folding a transient era in
+    /// there would let trying one on permanently rewrite the user's config.
+    era_override: Option<&'static config::era::Era>,
+    /// Whether the OS says this window has focus. Animation stops when it
+    /// doesn't: a retro terminal sitting behind your editor has no business
+    /// waking the GPU twenty times a second to move a bar nobody is looking
+    /// at. Assumed true until told otherwise, since a window that has just
+    /// opened generally has focus and the cost of being briefly wrong is one
+    /// or two frames.
+    window_focused: bool,
+    /// When the hum bar's drift started, for computing its phase.
+    animation_epoch: std::time::Instant,
+    /// When the last animation frame was drawn, for rate limiting.
+    last_animation_frame: std::time::Instant,
     ui: crate::ui::Ui,
     /// The settings panel, when open — a real OS window of its own, not an
     /// overlay on this one. `None` whenever it is closed, which is also
@@ -452,6 +519,10 @@ impl Graphics {
             mouse_gesture: None,
             selecting: None,
             hovered_url: None,
+            era_override: None,
+            window_focused: true,
+            animation_epoch: std::time::Instant::now(),
+            last_animation_frame: std::time::Instant::now(),
             ui,
             settings_window: None,
             settings_open_requested: false,
@@ -548,6 +619,142 @@ impl Graphics {
     /// nothing further, but font size feeds into cell measurement and
     /// every pane's PTY/grid size, so a change there has to trigger the
     /// same resize path a window resize or split would.
+    /// The era in effect for this session: the runtime override if one is
+    /// set, otherwise whatever the config asks for.
+    pub fn active_era(&self) -> Option<&'static config::era::Era> {
+        self.era_override.or_else(|| self.settings.retro.resolved_era())
+    }
+
+    /// Whether anything on screen is currently animating and so needs frames
+    /// drawn for it. Only true while the window has focus.
+    fn is_animating(&self) -> bool {
+        self.window_focused && self.effective_effects().is_animated()
+    }
+
+    /// Records whether the window has focus. Animation stops when it doesn't.
+    pub fn set_window_focused(&mut self, focused: bool) {
+        if self.window_focused != focused {
+            self.window_focused = focused;
+            // Regaining focus should resume immediately rather than waiting
+            // out a frame interval measured from whenever it was lost.
+            self.last_animation_frame = std::time::Instant::now() - HUM_FRAME_INTERVAL;
+        }
+    }
+
+    /// The screen effects to draw over the grid this frame.
+    ///
+    /// A session era override supplies its own strengths, but an *explicit*
+    /// `[retro]` setting still wins — someone who turned scanlines off meant
+    /// it, whichever era they're trying.
+    fn effective_effects(&self) -> render::Effects {
+        render::Effects {
+            scanlines: effect_strength(
+                self.settings.retro.scanlines,
+                self.era_override.map(|era| era.scanlines),
+                self.settings.retro.scanlines(),
+            ),
+            vignette: effect_strength(
+                self.settings.retro.vignette,
+                self.era_override.map(|era| era.vignette),
+                self.settings.retro.vignette(),
+            ),
+            hum: effect_strength(
+                self.settings.retro.hum,
+                self.era_override.map(|era| era.hum),
+                self.settings.retro.hum(),
+            ),
+            // Wrapped into one cycle rather than passed as elapsed seconds:
+            // an `f32` loses resolution after a few hours of uptime, and a
+            // phase never leaves 0.0–1.0.
+            hum_phase: hum_phase(self.animation_epoch.elapsed(), HUM_PERIOD),
+            // A scanline cycle is a fixed physical size, scaled to the
+            // display — tying it to the font would make the lines coarser
+            // just because someone bumped their text size, and tying it to
+            // raw pixels would make them invisible on a HiDPI screen.
+            scanline_period: (SCANLINE_PERIOD_POINTS * self.window.scale_factor() as f32).max(2.0),
+            // The theme's own foreground is the phosphor color, so the
+            // vignette's ambient lift is green on a green screen and amber on
+            // an amber one rather than a generic grey wash.
+            glow_color: self.effective_foreground_rgb(),
+        }
+    }
+
+    /// The font family to render the grid with: an era's period face when one
+    /// is installed, otherwise the configured family.
+    ///
+    /// Resolved per frame rather than cached because it depends on the era,
+    /// which the escape sequence can change at any moment — and it is only a
+    /// handful of string comparisons against an already-loaded font list.
+    fn effective_font_family(&self) -> &str {
+        if let Some(era) = self.active_era()
+            && let Some(font) = render::first_installed_family(era.fonts)
+        {
+            return font;
+        }
+        &self.settings.appearance.font_family
+    }
+
+    /// The theme in effect, session era override included. Falls back to
+    /// `Config`'s own resolution, which handles the configured era and theme.
+    fn effective_theme(&self) -> &'static config::themes::Theme {
+        match &self.era_override {
+            Some(era) => config::themes::find(era.theme).unwrap_or_else(|| self.settings.effective_theme()),
+            None => self.settings.effective_theme(),
+        }
+    }
+
+    fn effective_palette(&self) -> [[f32; 3]; 16] {
+        config::palette_of(self.effective_theme())
+    }
+
+    fn effective_foreground_rgb(&self) -> [f32; 3] {
+        config::foreground_of(self.effective_theme())
+    }
+
+    /// An explicit `appearance.background_color` still wins over any era —
+    /// someone who pinned their background meant it.
+    fn effective_background_rgb(&self) -> [f32; 3] {
+        config::background_override(&self.settings.appearance)
+            .unwrap_or_else(|| config::background_of(self.effective_theme()))
+    }
+
+    /// Sets (or clears) the session era override directly — for `--era`, and
+    /// for tests. Same session-only guarantee as `request_era`: this never
+    /// touches `self.settings`, so it can't be saved to the config file.
+    pub fn set_era_override(&mut self, era: Option<&'static config::era::Era>) {
+        self.era_override = era;
+        self.apply_era_change();
+    }
+
+    /// Re-applies everything an era controls beyond color, which the renderer
+    /// picks up on its own each frame. Currently just the cell geometry, since
+    /// an era may bring its own font.
+    fn apply_era_change(&mut self) {
+        self.remeasure_cell();
+    }
+
+    /// Applies an era requested at runtime by [`pane::retro`]'s escape
+    /// sequence, or clears the override when the name isn't one we know
+    /// (which is how `era=` spells "back to my config").
+    ///
+    /// Session-only by design: this never touches `self.settings` and so can
+    /// never be written to `config.toml` by a later save. A restart always
+    /// returns the user to the era they actually chose.
+    fn request_era(&mut self, name: &str) {
+        let next = config::era::find(name);
+        if next.map(|era| era.name) == self.era_override.map(|era| era.name) {
+            return;
+        }
+        if crate::verbose::is_verbose(crate::verbose::Category::General) {
+            match next {
+                Some(era) => eprintln!("retro: era set to {:?} by escape sequence", era.name),
+                None => eprintln!("retro: era override cleared by escape sequence ({name:?})"),
+            }
+        }
+        self.era_override = next;
+        self.apply_era_change();
+    }
+
     fn apply_settings(&mut self, new_settings: config::Config) {
         let font_size_changed = new_settings.appearance.font_size != self.settings.appearance.font_size;
         let font_family_changed = new_settings.appearance.font_family != self.settings.appearance.font_family;
@@ -558,11 +765,7 @@ impl Graphics {
         }
         self.settings = new_settings;
         if font_size_changed || font_family_changed {
-            self.cell = render::measure_cell(
-                scaled_font_size(self.settings.appearance.font_size, self.window.scale_factor()),
-                &self.settings.appearance.font_family,
-            );
-            self.resize_panes_to_geometry();
+            self.remeasure_cell();
         }
         if scrollback_changed {
             // Applied to every pane that's already open, not just ones
@@ -729,9 +932,22 @@ impl Graphics {
     /// it has to be recomputed whenever that scale factor itself
     /// changes — the same as a font-size settings change.
     pub fn rescale(&mut self) {
+        self.remeasure_cell();
+    }
+
+    /// Re-measures the grid cell from the font actually in use, and resizes
+    /// every pane's PTY and grid to match.
+    ///
+    /// Single point for this because the font can change for three unrelated
+    /// reasons — a config edit, a DPI change, and now an era swapping in a
+    /// period face. A cell size that disagrees with the font being rendered
+    /// misplaces every glyph, so none of those paths can afford to be the one
+    /// that forgets.
+    fn remeasure_cell(&mut self) {
+        let family = self.effective_font_family().to_string();
         self.cell = render::measure_cell(
             scaled_font_size(self.settings.appearance.font_size, self.window.scale_factor()),
-            &self.settings.appearance.font_family,
+            &family,
         );
         self.resize_panes_to_geometry();
     }
@@ -1658,11 +1874,16 @@ impl Graphics {
         }
 
         let mut exited = Vec::new();
+        let mut requested_era = None;
         let focused = self.focused;
         for (pane, session) in self.panes.iter_mut() {
             let pumped = session.pump();
             if pumped.changed {
                 outcome.needs_redraw = true;
+            }
+            // Last request in this poll wins, whichever pane it came from.
+            if let Some(era) = pumped.requested_era {
+                requested_era = Some(era);
             }
 
             // Activity is diffed rather than assumed dirty, the same way
@@ -1691,6 +1912,19 @@ impl Graphics {
                 outcome.panes_remain = false;
                 return outcome;
             }
+        }
+
+        // Applied after the loop, which held `self.panes` mutably.
+        if let Some(name) = requested_era {
+            self.request_era(&name);
+            outcome.needs_redraw = true;
+        }
+
+        // The hum bar is the one thing here that moves on its own, so it has
+        // to ask for its own frames — rate-limited, and only while focused.
+        if self.is_animating() && self.last_animation_frame.elapsed() >= HUM_FRAME_INTERVAL {
+            self.last_animation_frame = std::time::Instant::now();
+            outcome.needs_redraw = true;
         }
 
         // A title only forces a repaint when it actually differs — the
@@ -1745,10 +1979,14 @@ impl Graphics {
         // Whichever comes first. Without egui's deadline in here, an
         // animation or a pending settle-frame would wait out the full
         // title-scan interval before being drawn.
-        match self.ui_repaint_at {
+        let mut deadline = match self.ui_repaint_at {
             Some(ui) => title_scan.min(ui),
             None => title_scan,
+        };
+        if self.is_animating() {
+            deadline = deadline.min(self.last_animation_frame + HUM_FRAME_INTERVAL);
         }
+        deadline
     }
 
     /// Draws the current state. Assumes `poll` has already run; this does
@@ -1776,13 +2014,13 @@ impl Graphics {
         // actual ambient background, not some other fixed value, or a
         // "colored" background rect would visibly seam against the real
         // one drawn behind it.
-        let background_rgb = self.settings.appearance.background_rgb();
+        let background_rgb = self.effective_background_rgb();
         // The theme supplies both the 16 ANSI slots and what a cell left at
         // its default foreground resolves to. Read fresh each frame, like
         // every other appearance setting, so switching theme restyles
         // already-running panes with nothing to invalidate.
-        let palette = self.settings.appearance.palette();
-        let foreground_rgb = self.settings.appearance.foreground_rgb();
+        let palette = self.effective_palette();
+        let foreground_rgb = self.effective_foreground_rgb();
         // The cursor and selection highlight both use the user's chosen
         // accent color (Settings' "Accent color") rather than a fixed
         // constant — unlike the broadcast-target border, which is a fixed
@@ -2058,17 +2296,35 @@ impl Graphics {
             b: (bg_b * transparency) as f64,
             a: transparency as f64,
         };
+        // Resolved before the call: `effective_font_family` borrows `self`
+        // immutably and `grid.render` needs it mutably.
+        let font_family = self.effective_font_family().to_string();
+        let effects = self.effective_effects();
+        // Content rects only: the effects must not paint over the pane title
+        // bars, which are chrome rather than part of the simulated screen.
+        let effect_areas: Vec<(f32, f32, f32, f32)> = if effects.is_empty() {
+            Vec::new()
+        } else {
+            geometry
+                .panes
+                .iter()
+                .map(|pane_rect| Self::content_rect(pane_rect.rect, cell))
+                .map(|rect| (rect.x, rect.y, rect.width, rect.height))
+                .collect()
+        };
         self.grid.render(
             &self.device,
             &self.queue,
             &view,
             (self.config.width, self.config.height),
             scaled_font_size(self.settings.appearance.font_size, self.window.scale_factor()),
-            &self.settings.appearance.font_family,
+            &font_family,
             background,
             rects.into_iter(),
             glyphs.into_iter(),
             pane_runs.into_iter(),
+            effects,
+            &effect_areas,
         );
 
         let group_names = self.router.group_names();
@@ -2382,6 +2638,91 @@ fn push_border(rects: &mut Vec<render::SolidRect>, rect: Rect, thickness: f32, c
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_hum_phase_wraps_within_one_cycle() {
+        let period = std::time::Duration::from_secs(9);
+
+        assert_eq!(hum_phase(std::time::Duration::ZERO, period), 0.0);
+        assert!((hum_phase(std::time::Duration::from_millis(4500), period) - 0.5).abs() < 1e-6);
+        // A full period returns to the start rather than growing without
+        // bound — which is the point, since an ever-growing `f32` loses
+        // resolution after a few hours of uptime.
+        assert!(hum_phase(period, period).abs() < 1e-6);
+        assert!((hum_phase(period * 100 + std::time::Duration::from_millis(4500), period) - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn the_hum_phase_stays_in_range_over_a_long_uptime() {
+        let period = std::time::Duration::from_secs(9);
+        for hours in [1u64, 24, 24 * 30] {
+            let phase = hum_phase(std::time::Duration::from_secs(hours * 3600), period);
+            assert!((0.0..1.0).contains(&phase), "phase {phase} out of range after {hours}h");
+        }
+    }
+
+    #[test]
+    fn a_zero_period_does_not_divide_by_zero() {
+        assert_eq!(hum_phase(std::time::Duration::from_secs(5), std::time::Duration::ZERO), 0.0);
+    }
+
+    /// Only the hum bar animates. If the static effects ever started
+    /// reporting as animated, the terminal would stop sleeping when idle for
+    /// no visible reason.
+    #[test]
+    fn only_the_hum_bar_counts_as_animated() {
+        let still = render::Effects { scanlines: 1.0, vignette: 1.0, hum: 0.0, ..Default::default() };
+        assert!(!still.is_animated());
+        assert!(!still.is_empty(), "it still has something to draw");
+
+        let moving = render::Effects { hum: 0.01, ..Default::default() };
+        assert!(moving.is_animated());
+        assert!(!moving.is_empty());
+    }
+
+    #[test]
+    fn a_hum_only_configuration_still_draws() {
+        let hum_only = render::Effects { scanlines: 0.0, vignette: 0.0, hum: 0.3, ..Default::default() };
+        assert!(!hum_only.is_empty(), "the hum bar alone must not be skipped as 'no effects'");
+    }
+
+    #[test]
+    fn an_explicit_effect_setting_beats_a_session_era() {
+        // Scanlines turned off by hand stay off even while trying an era
+        // that would enable them.
+        assert_eq!(effect_strength(Some(0), Some(40), 40), 0.0);
+        assert_eq!(effect_strength(Some(100), Some(10), 10), 1.0);
+    }
+
+    #[test]
+    fn a_session_era_beats_the_configured_value() {
+        assert_eq!(effect_strength(None, Some(50), 0), 0.5);
+    }
+
+    #[test]
+    fn with_no_override_the_configured_value_is_used() {
+        assert_eq!(effect_strength(None, None, 25), 0.25);
+        assert_eq!(effect_strength(None, None, 0), 0.0);
+    }
+
+    /// A hand-edited config must not be able to hand the shader a strength
+    /// above 1.0, which would darken past black and could hide text.
+    #[test]
+    fn an_out_of_range_strength_is_clamped() {
+        assert_eq!(effect_strength(Some(9999), None, 0), 1.0);
+        assert_eq!(effect_strength(None, Some(500), 0), 1.0);
+    }
+
+    /// Zero strengths mean the renderer skips the overlay pass entirely, which
+    /// is what keeps the default path free.
+    #[test]
+    fn no_effects_means_nothing_to_draw() {
+        let none = render::Effects { scanlines: 0.0, vignette: 0.0, ..Default::default() };
+        assert!(none.is_empty());
+
+        let some = render::Effects { scanlines: 0.01, vignette: 0.0, ..Default::default() };
+        assert!(!some.is_empty());
+    }
 
     #[test]
     fn group_color_is_deterministic_for_the_same_name() {

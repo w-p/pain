@@ -7,11 +7,11 @@ use std::thread;
 
 /// What one [`PaneSession::pump`] found.
 ///
-/// `changed` drives repainting; the other two feed the pane's title-bar
+/// `changed` drives repainting; `output` and `bell` feed the pane's title-bar
 /// activity dot (`crate::activity`). They're deliberately separate: a pane
 /// whose shell merely exited has `changed` set but did nothing worth
 /// flagging for attention.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct PumpOutcome {
     /// Whether anything changed such that a redraw is warranted.
     pub changed: bool,
@@ -19,6 +19,9 @@ pub struct PumpOutcome {
     pub output: bool,
     /// Whether the program rang the terminal bell.
     pub bell: bool,
+    /// A retro era the program asked for via this terminal's own escape
+    /// sequence — see `pane::retro`. Session-only; never saved.
+    pub requested_era: Option<String>,
 }
 
 /// A running shell plus the screen its output is parsed into.
@@ -115,11 +118,14 @@ impl PaneSession {
     /// an idle pane must cost nothing.
     pub fn pump(&mut self) -> PumpOutcome {
         let mut outcome = PumpOutcome::default();
+
         while let Ok(chunk) = self.rx.try_recv() {
             self.screen.advance(&chunk);
             outcome.changed = true;
             outcome.output = true;
         }
+
+        outcome.requested_era = self.screen.take_requested_era();
 
         let writes = self.screen.take_pty_writes();
         if !writes.is_empty()
@@ -339,6 +345,56 @@ mod tests {
         }
 
         assert_eq!(cwd, expected, "an uninjected shell's cwd should be readable from the process table");
+    }
+
+    /// Asks a real shell to emit the private era sequence, and returns what
+    /// `pump` surfaced.
+    ///
+    /// The `\\033`/`\\007` are deliberately *literal backslashes* in the bytes
+    /// written to the shell — it is the shell's `printf` that turns them into
+    /// ESC and BEL. Writing Rust's own `\\x1b` here would work too, but it
+    /// wouldn't be testing the thing a user actually types.
+    fn era_requested_via_shell(era: &str) -> Option<String> {
+        let mut session =
+            PaneSession::spawn(Some("sh"), pane::Size { rows: 24, cols: 80 }, 100, None, crate::waker::Waker::noop())
+                .expect("spawn a real pane");
+
+        // Octal escapes rather than `\\e`/`\\a`: POSIX printf guarantees
+        // `\\ooo`, while the letter forms are a bash extension.
+        let command = format!("printf '\\033]7331;era={era}\\007'\n");
+        session.write_input(command.as_bytes()).expect("write the era request");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(requested) = session.pump().requested_era {
+                return Some(requested);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    /// The easter egg, end to end through a real shell: `printf` emits the
+    /// private escape sequence, the scanner picks it out of live PTY output,
+    /// and `pump` surfaces the era name.
+    ///
+    /// This is what makes the feature testable at all. Every layer under it
+    /// is unit-tested (`pane::retro`, `config::era`), but only this proves
+    /// they're connected to a real shell writing real bytes.
+    #[test]
+    fn a_real_shell_can_request_an_era_with_an_escape_sequence() {
+        assert_eq!(era_requested_via_shell("amber").as_deref(), Some("amber"));
+    }
+
+    /// Every era travels the same route — the scanner carries a name and
+    /// knows nothing about which eras exist.
+    #[test]
+    fn a_real_shell_can_request_any_era_by_name() {
+        let requested = era_requested_via_shell("matrix").expect("the era should arrive");
+        assert_eq!(requested, "matrix");
+        assert!(config::era::find(&requested).is_some(), "the requested name should resolve to a real era");
     }
 
     /// The whole chain, through a real shell rather than a stand-in: a

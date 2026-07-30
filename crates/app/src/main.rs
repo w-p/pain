@@ -78,6 +78,26 @@ fn main() -> anyhow::Result<()> {
     if let Some(flag) = args.iter().find(|a| *a == "--verbose" || *a == "-v" || a.starts_with("--verbose=")) {
         verbose::set_verbose(flag.strip_prefix("--verbose="));
     }
+    // `--era=NAME` tries an era for one session without touching the config
+    // file, and `--era=list` prints what's on offer.
+    let mut startup_era = None;
+    if let Some(flag) = args.iter().find(|a| a.starts_with("--era=") || *a == "--era") {
+        let value = flag.strip_prefix("--era=").unwrap_or("").trim();
+        if value.eq_ignore_ascii_case("list") {
+            print!("{}", era_listing());
+            return Ok(());
+        }
+        match config::era::find(value) {
+            Some(era) => startup_era = Some(era),
+            // Empty is how "off" is spelled, so it isn't an error.
+            None if value.is_empty() => {}
+            None => {
+                eprintln!("pain: unknown era {value:?}\n");
+                print!("{}", era_listing());
+                std::process::exit(2);
+            }
+        }
+    }
 
     let event_loop = build_event_loop()?;
     // Sleep between events rather than spinning. PTY output arrives on
@@ -87,7 +107,7 @@ fn main() -> anyhow::Result<()> {
     // foreground-process scan that keeps pane titles current).
     event_loop.set_control_flow(ControlFlow::Wait);
 
-    let mut app = App { waker: Some(waker::Waker::new(event_loop.create_proxy())), ..App::default() };
+    let mut app = App { waker: Some(waker::Waker::new(event_loop.create_proxy())), startup_era, ..App::default() };
     event_loop.run_app(&mut app)?;
     Ok(())
 }
@@ -126,6 +146,16 @@ the README at https://github.com/w-p/pain
         version = env!("CARGO_PKG_VERSION"),
         config = config::Config::default_path().display(),
     )
+}
+
+/// The `--era=list` output.
+fn era_listing() -> String {
+    let mut out = String::from("Retro eras (appearance.era, or --era=NAME):\n\n");
+    for era in config::era::listed() {
+        out.push_str(&format!("  {:<8} {}\n", era.name, era.blurb));
+    }
+    out.push_str("\n  off      no era (the default)\n");
+    out
 }
 
 /// Builds the event loop, forcing X11 under WSL.
@@ -236,6 +266,9 @@ struct App {
     /// Wakes this loop when a PTY reader has output. `None` only before
     /// `main` fills it in, which can't happen once running.
     waker: Option<waker::Waker>,
+    /// An era from `--era`, applied once the window exists. Session-only, so
+    /// it never reaches the config file.
+    startup_era: Option<&'static config::era::Era>,
 }
 
 /// How close together in time two presses must be to count as a
@@ -368,8 +401,12 @@ impl ApplicationHandler for App {
         };
 
         let waker = self.waker.clone().expect("waker is installed before the loop runs");
+        let startup_era = self.startup_era;
         match Graphics::new(window, session, waker) {
-            Ok(graphics) => {
+            Ok(mut graphics) => {
+                if let Some(era) = startup_era {
+                    graphics.set_era_override(Some(era));
+                }
                 graphics.window().request_redraw();
                 self.graphics = Some(graphics);
             }
@@ -561,10 +598,16 @@ impl ApplicationHandler for App {
             // Focus can be lost mid-drag (alt-tab, another window taking
             // over) and no release is ever delivered for the press that's
             // still outstanding — same latch, different cause.
-            WindowEvent::Focused(false) => {
-                let modifiers = mouse_modifiers(self.modifiers);
-                if graphics.end_pointer_gestures(self.cursor_pos, modifiers) {
-                    graphics.window().request_redraw();
+            //
+            // Focus also gates animation: a retro terminal behind another
+            // window stops drawing frames for its hum bar entirely.
+            WindowEvent::Focused(focused) => {
+                graphics.set_window_focused(focused);
+                if !focused {
+                    let modifiers = mouse_modifiers(self.modifiers);
+                    if graphics.end_pointer_gestures(self.cursor_pos, modifiers) {
+                        graphics.window().request_redraw();
+                    }
                 }
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } if !ui_consumed => {

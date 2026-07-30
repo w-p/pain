@@ -101,6 +101,7 @@ pub struct Screen {
     /// Set by [`Screen::drain_events`], cleared by [`Screen::take_bell`].
     bell_rang: bool,
     cwd: crate::cwd::CwdWatcher,
+    retro: crate::retro::RetroWatcher,
     /// Kept so [`Screen::set_scrollback`] can change one field without
     /// resetting the rest of what `Term` was configured with.
     config: Config,
@@ -136,6 +137,7 @@ impl Screen {
             pending_writes: Vec::new(),
             bell_rang: false,
             cwd: crate::cwd::CwdWatcher::new(),
+            retro: crate::retro::RetroWatcher::new(),
             config,
         }
     }
@@ -159,6 +161,14 @@ impl Screen {
     pub fn advance(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.term, bytes);
         self.cwd.advance(bytes);
+        self.retro.advance(bytes);
+    }
+
+    /// A retro era requested via this terminal's own escape sequence, if one
+    /// arrived since the last call — see `crate::retro`. Session-only: the
+    /// caller applies it to running state and never writes it to config.
+    pub fn take_requested_era(&mut self) -> Option<String> {
+        self.retro.take_requested_era()
     }
 
     /// The pane's most recently reported working directory, if any OSC 7

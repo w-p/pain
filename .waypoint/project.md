@@ -197,21 +197,30 @@ hardware; the shell-integration fix itself and PowerShell specifically are
 not yet re-verified there — needs another pass before Milestone 8
 (cross-platform pass) starts.
 
-**Uncommitted, awaiting review (2026-07-28)** — a feature pass drawn from
-studying herdr.dev and ghostty.org at the developer's request. Four
-things, plus color emoji.
+**Retro eras (v1.11.0, 2026-07-30).** An opt-in period look — `green`,
+`amber`, `cga`, `bbs`, `c64`, `matrix` — bundling a palette, screen effects
+and a typeface preference under one name. Off by default and byte-identical
+to before when off. Full account in `.waypoint/features/retro.md`; the
+short version of what was learned:
 
-**Confirmed working on the developer's real hardware:** color emoji,
-ligatures, and the theme picker. **Confirmed and then fixed:** the pane
-activity indicator — it was a square rather than a dot (now drawn as a
-`\u{25CF}` glyph), and a bell rung in the *focused* pane was erased before
-it could be seen (see `.waypoint/features/pane-activity.md`; the rule now
-clears a bell on input rather than on focus). **Still unverified:** the
-Windows console fix, which the developer will test after the next
-release. Full account in the memory log. One thing needing the
-developer's judgement: OSC 8 links are held to the same scheme allowlist
-as pattern-matched ones, which means `ls --hyperlink`'s `file://` links
-are deliberately not clickable.
+- Eras are **data, not code** (`config::era`), reusing the existing 600+
+  theme table for palettes. Adding one is a table row.
+- The era **overlays** settings and never writes them, so trying one on
+  can't overwrite a chosen theme.
+- Effects are a fullscreen-ish overlay pass drawn per *pane content rect*,
+  which is what keeps title-bar chrome clean. No offscreen target.
+- **Two features were built and then removed**, both on the developer's
+  call after real use: output pacing at a serial baud rate (it makes
+  `htop` and other full-screen programs unusable — they repaint
+  continuously), and a hidden "easter egg" era (it's just a fun feature).
+  A third, bundling period fonts, was built and reverted in favour of
+  recommending them. All three are documented with their reasoning so
+  they aren't rediscovered from scratch.
+- The **hum bar is the project's first animated effect** and so the first
+  thing that stops an idle terminal sleeping. Bounded three ways: it stops
+  when the window loses focus, redraws at 20fps rather than the display
+  rate, and is off at `hum = 0`. Measured at ~1.2% → ~2.7% of a core under
+  software rendering.
 
 **Shipped:**
 

@@ -25,6 +25,13 @@ machine, and exit.
 .BR \-V ", " \-\-version
 Print the version and exit.
 .TP
+.BR \-\-era = \fINAME\fR
+Use a retro era for this session only, without writing to the config file.
+.B \-\-era=list
+prints the available eras and exits. See
+.B RETRO ERAS
+below.
+.TP
 .BR \-v ", " \-\-verbose [ =\fILIST\fR ]
 Enable diagnostic logging on standard error.
 .I LIST
@@ -192,6 +199,73 @@ watching, so looking at it suffices. A bell usually rings the instant a
 command starts \(em while its own pane is still focused, because you just
 pressed Enter there \(em so it survives focus and clears on the next input
 to that pane, which is what actually demonstrates you saw it.
+.SH RETRO ERAS
+An era is a period look for a specific machine rather than a general retro
+mood: a palette, screen effects, and a typeface, bundled under one name.
+.PP
+The \fBmatrix\fR era is the one entry on this list that never existed.
+.TP
+.B green
+IBM 5151, 1981 \(em P1 green phosphor.
+.TP
+.B amber
+Amber CRT, mid-1980s \(em P3 phosphor, easier on the eyes.
+.TP
+.B cga
+IBM 5153, 1981 \(em the CGA 16.
+.TP
+.B bbs
+Dial-up BBS, ~1993 \(em the CGA palette ANSI art was drawn for.
+.TP
+.B c64
+Commodore 64, 1982 \(em VIC-II blues.
+.TP
+.B matrix
+Not a machine, and not 1999's idea of one either.
+.PP
+Set one in
+.BR [retro] ,
+choose it in Settings under Retro, or try one for a single session without
+touching the config file:
+.PP
+.RS
+.nf
+pain \-\-era=amber
+pain \-\-era=list
+.fi
+.RE
+.PP
+An era can also be set live by a shell or a script, using this terminal's own
+escape sequence:
+.PP
+.RS
+.nf
+printf '\\e]7331;era=green\\a'
+.fi
+.RE
+.PP
+That is session-only and never written to the config file, so a restart
+returns to whatever was chosen there. The payload is an era
+.I name
+rather than a set of colors, so program output cannot produce an unreadable
+screen \(em the worst it can do is make the terminal look like 1985.
+.PP
+Anything set explicitly wins over the era, including
+.BR appearance.background_color :
+a value someone chose is not overridden by trying a costume on.
+.PP
+The screen effects are deliberately static \(em no animation and no time
+input. They add one draw to a frame that was already being rendered, so an
+idle terminal still renders nothing and still sleeps.
+.PP
+Eras name period typefaces rather than bundling them, and use one if it is
+installed \(em \fBVT323\fR for the phosphor eras, \fBPx437 IBM VGA 8x16\fR
+for the DOS ones, \fBC64 Pro Mono\fR for \fBc64\fR. None ship with this
+program; see the README for where to obtain them. Without one an era still
+applies its palette and effects and keeps the configured font.
+.PP
+Effects cover the terminal grid only. Pane title bars are chrome and are left
+alone.
 .SH CONFIGURATION
 Configuration is a TOML file, read at startup and re-read when it changes.
 Every key is optional and anything missing uses its default, so a partial
@@ -306,6 +380,48 @@ hex, default
 Used for the cursor, the selection highlight, and interactive highlights in
 menus and the settings panel. Semantic colors, such as the broadcast-target
 border, are fixed and not affected by this.
+.SS [retro]
+Period looks, off by default. See
+.B RETRO ERAS
+below.
+.TP
+.B era
+String, default empty.
+Names an era. Empty means off, which renders byte-for-byte as if this section
+did not exist. An unrecognised name is treated as off rather than failing the
+load.
+.IP
+An active era overrides
+.B appearance.theme
+with its own palette, but never writes to it \(em turning the era off
+restores the chosen theme, so trying one on cannot lose a setting.
+.TP
+.B scanlines
+Integer 0-100, default absent. Strength of the horizontal scanline pattern.
+Absent follows the era;
+.B 0
+turns it off while keeping the rest of the era.
+.TP
+.B hum
+Integer 0-100, default absent. Strength of the drifting mains-hum bar \(em the
+soft band that crept up an old monitor when its power supply and the mains
+supply were slightly out of step. Absent follows the era.
+.IP
+This is the only effect that moves, and so the only one that keeps the
+terminal drawing while it sits idle. The cost is bounded: it stops entirely
+when the window loses focus, and redraws well below the display's refresh rate,
+since the bar takes about nine seconds to cross the screen. Set it to
+.B 0
+to recover the idle cost completely.
+.TP
+.B vignette
+Integer 0-100, default absent. Strength of the curved-glass effect. Absent
+follows the era.
+.IP
+This both darkens toward the corners and lifts the centre with a faint glow in
+the theme's foreground color. The lift is what makes the darkening visible at
+all: every CRT palette has a near-black background, and darkening near-black
+by a quarter moves it three levels out of 255.
 .SS [cursor]
 .TP
 .B style

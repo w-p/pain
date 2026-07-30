@@ -1,6 +1,7 @@
 //! PTY wrapper: spawns a shell and exposes it as a plain byte stream.
 
 mod cwd;
+mod retro;
 mod term;
 
 use std::io::{Read, Write};

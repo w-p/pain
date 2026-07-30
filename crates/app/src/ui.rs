@@ -210,6 +210,14 @@ pub struct SettingsDraft {
     scrollback_lines: usize,
     default_shell: String,
     cursor_style: config::CursorStyle,
+    /// Era name, or empty for off. Round-trips whatever it was given rather
+    /// than resetting it, so a name this build doesn't know — from a newer
+    /// version, or a typo someone means to fix — survives a save.
+    era: String,
+    /// `None` follows the era, matching `config::Retro`'s own convention.
+    scanlines: Option<u32>,
+    vignette: Option<u32>,
+    hum: Option<u32>,
 }
 
 impl SettingsDraft {
@@ -231,6 +239,37 @@ impl SettingsDraft {
             scrollback_lines: config.general.scrollback_lines,
             default_shell: config.general.default_shell.clone(),
             cursor_style: config.cursor.style,
+            era: config.retro.era.clone(),
+            scanlines: config.retro.scanlines,
+            vignette: config.retro.vignette,
+            hum: config.retro.hum,
+        }
+    }
+
+    /// The era this draft currently selects.
+    fn selected_era(&self) -> Option<&'static config::era::Era> {
+        config::era::find(&self.era)
+    }
+
+    /// What the era row should read. A name that doesn't resolve to any era
+    /// is shown as "Off", which is what it renders as.
+    fn era_label(&self) -> String {
+        match self.selected_era() {
+            Some(era) => era.name.to_string(),
+            None => "Off".to_string(),
+        }
+    }
+
+    /// An era-backed value as it should appear in the UI: the explicit setting
+    /// if there is one, otherwise the era's, otherwise zero.
+    ///
+    /// The sliders are always showing *something* real, so someone dragging
+    /// one starts from the value already on screen rather than snapping away
+    /// from it.
+    fn era_backed(&self, explicit: Option<u32>, from_era: impl Fn(&config::era::Era) -> u32) -> u32 {
+        match explicit {
+            Some(value) => value,
+            None => self.selected_era().map_or(0, from_era),
         }
     }
 
@@ -265,8 +304,66 @@ impl SettingsDraft {
         config.general.scrollback_lines = self.scrollback_lines;
         config.general.default_shell = self.default_shell.clone();
         config.cursor.style = self.cursor_style;
+        config.retro.era = self.era.clone();
+        config.retro.scanlines = self.scanlines;
+        config.retro.vignette = self.vignette;
+        config.retro.hum = self.hum;
         config
     }
+}
+
+/// Why the hum bar is worth knowing about before turning it up.
+const HUM_HINT: &str = "\
+The soft band that drifted up an old monitor when its power supply and the \
+mains supply were slightly out of step.
+
+This is the only effect that moves, so it is the only one that keeps the \
+terminal drawing while it sits idle. It stops when the window loses focus, \
+and redraws well below your display's rate — but 0 is how you get the idle \
+cost back entirely.";
+
+/// Width reserved for the little "follow the era again" button beside an
+/// era-backed control.
+const RESET_BUTTON_WIDTH: f32 = 26.0;
+
+/// A 0-100 slider for a setting that follows the era until it's touched.
+///
+/// `effective` is what the era (or an existing override) currently yields, so
+/// the slider always shows the value actually in force. Moving it writes an
+/// explicit override; the reset button hands control back to the era.
+fn era_backed_slider(ui: &mut egui::Ui, width: f32, explicit: &mut Option<u32>, effective: u32) -> egui::Response {
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, ui.spacing().interact_size.y),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            let mut value = effective;
+            let slider = ui.add_sized(
+                egui::vec2(width - RESET_BUTTON_WIDTH - 4.0, ui.spacing().interact_size.y),
+                egui::Slider::new(&mut value, 0..=config::MAX_EFFECT).suffix("%"),
+            );
+            if slider.changed() {
+                *explicit = Some(value);
+            }
+            reset_to_era(ui, explicit);
+        },
+    )
+    .response
+}
+
+/// The button that clears an override so the setting follows the era again.
+/// Disabled when there is nothing to clear, so the control always says whether
+/// the current value is the era's or the user's.
+fn reset_to_era(ui: &mut egui::Ui, explicit: &mut Option<u32>) {
+    let overridden = explicit.is_some();
+    let response = ui.add_enabled(overridden, egui::Button::new("↺").min_size(egui::vec2(RESET_BUTTON_WIDTH, 0.0)));
+    if response.clicked() {
+        *explicit = None;
+    }
+    response.on_hover_text(if overridden {
+        "Overridden. Click to follow the era again."
+    } else {
+        "Following the era."
+    });
 }
 
 /// Theme names matching `filter` — case-insensitive substring, an empty
@@ -1414,6 +1511,44 @@ pub fn settings_panel(
         });
 
         ui.separator();
+        section_header(ui, "Retro");
+        egui::Grid::new("settings-retro").num_columns(2).spacing([GRID_COLUMN_GAP, 9.0]).show(ui, |ui| {
+            grid_label(ui, "Era", label_width);
+            egui::ComboBox::from_id_salt("retro-era").width(value_width).selected_text(draft.era_label()).show_ui(
+                ui,
+                |ui| {
+                    ui.selectable_value(&mut draft.era, String::new(), "Off")
+                        .on_hover_text("No era. Byte-for-byte the default rendering.");
+                    for era in config::era::listed() {
+                        ui.selectable_value(&mut draft.era, era.name.to_string(), era.name).on_hover_text(era.blurb);
+                    }
+                },
+            );
+            ui.end_row();
+
+            // Below here the sliders show the era's values until someone
+            // moves one, at which point it becomes an explicit override. The
+            // reset button is how you hand it back to the era.
+            // Effective values read out before taking `&mut` on the fields —
+            // `era_backed` borrows the whole draft.
+            let scanlines = draft.era_backed(draft.scanlines, |era| era.scanlines);
+            let vignette = draft.era_backed(draft.vignette, |era| era.vignette);
+            let hum = draft.era_backed(draft.hum, |era| era.hum);
+
+            grid_label(ui, "Scanlines", label_width);
+            era_backed_slider(ui, value_width, &mut draft.scanlines, scanlines);
+            ui.end_row();
+
+            grid_label(ui, "Vignette", label_width);
+            era_backed_slider(ui, value_width, &mut draft.vignette, vignette);
+            ui.end_row();
+
+            grid_label(ui, "Hum bar", label_width);
+            era_backed_slider(ui, value_width, &mut draft.hum, hum).on_hover_text(HUM_HINT);
+            ui.end_row();
+        });
+
+        ui.separator();
         section_header(ui, "Terminal");
         egui::Grid::new("settings-terminal").num_columns(2).spacing([GRID_COLUMN_GAP, 9.0]).show(ui, |ui| {
             grid_label(ui, "Transparency", label_width);
@@ -1600,6 +1735,58 @@ mod tests {
 
     /// The reason this section changed at all: someone who has never edited
     /// their config used to see an empty box.
+    #[test]
+    fn a_draft_round_trips_the_retro_section() {
+        let mut config = config::Config::default();
+        config.retro.era = "bbs".to_string();
+        config.retro.scanlines = Some(12);
+
+        let saved = SettingsDraft::from_config(&config).apply_to(&config);
+        assert_eq!(saved.retro.era, "bbs");
+        assert_eq!(saved.retro.scanlines, Some(12));
+        assert_eq!(saved.retro.vignette, None, "an unset override must stay unset, not be pinned to the era's value");
+    }
+
+    /// The sliders show the era's values, so opening Settings and pressing
+    /// Save must not silently convert every era default into an override —
+    /// that would freeze the look and stop it tracking the era.
+    #[test]
+    fn opening_and_saving_settings_does_not_pin_era_defaults_as_overrides() {
+        let config = config::Config {
+            retro: config::Retro { era: "green".to_string(), ..Default::default() },
+            ..Default::default()
+        };
+
+        let saved = SettingsDraft::from_config(&config).apply_to(&config);
+        assert_eq!(saved.retro.scanlines, None);
+        assert_eq!(saved.retro.vignette, None);
+        // ...and the effective values still come from the era.
+        assert_eq!(saved.retro.scanlines(), config::era::find("green").unwrap().scanlines);
+    }
+
+    /// An era name this build doesn't recognise must survive a Settings
+    /// round-trip rather than being silently reset to "Off" — it may come
+    /// from a newer version, and quietly discarding it would lose the choice.
+    #[test]
+    fn an_unrecognised_era_name_survives_a_settings_round_trip() {
+        let config = config::Config {
+            retro: config::Retro { era: "some-future-era".to_string(), ..Default::default() },
+            ..Default::default()
+        };
+
+        let draft = SettingsDraft::from_config(&config);
+        assert_eq!(draft.era_label(), "Off", "it renders as off, so it should say so");
+
+        let saved = draft.apply_to(&config);
+        assert_eq!(saved.retro.era, "some-future-era", "but the name itself must not be discarded");
+    }
+
+    #[test]
+    fn the_era_row_reads_off_when_no_era_is_set() {
+        let draft = SettingsDraft::from_config(&config::Config::default());
+        assert_eq!(draft.era_label(), "Off");
+    }
+
     #[test]
     fn an_empty_config_still_lists_every_built_in_binding() {
         let rows = effective_binding_rows(&BTreeMap::new());

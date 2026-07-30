@@ -4352,3 +4352,85 @@
   adding a gate changes what blocks their pushes.
 
   263 tests, clippy clean, build clean.
+
+  **Update — 2026-07-29/30: retro eras (v1.11.0).** Developer asked to
+  "get wild and creative" honoring terminal history back to the 486 days.
+  Proposed a tiered menu (cheap/one-pass/offscreen-target); they picked
+  tiers 1-2 and asked how to make it opt-in and easter-egg-ish. Built on a
+  `retro` branch (their request) off v1.10.0.
+
+  **Design that held up:** an era is **data, not code** —
+  `config::era::ERAS` is a table, adding one is a row, the renderer never
+  branches per era. Palettes reuse the existing 600+ theme table (`Green
+  Phosphor CRT`, `Amber CRT Retro`, `IBM 5153 CGA`, `C64`, `Matrix` were
+  already in it). The era **overlays** settings and never writes them —
+  `era_override` deliberately lives outside `settings`, because the
+  settings panel saves from `settings` and folding a transient era in
+  would let *trying one on* permanently rewrite the user's theme.
+  `Option<u32>` settings mean "absent follows the era", reusing the
+  `background_color`/`theme` relationship rather than inventing a second
+  one.
+
+  **Three things were built and then removed. All three were right to
+  remove, and all three are documented so they aren't rediscovered:**
+
+  1. **Baud-rate output pacing.** Genuinely fun, exactly-tested (integer
+     bit-nanosecond accounting after an `f64` drift bug my own test
+     caught). Removed because it makes `htop`/`vim`/`less` unusable —
+     anything on the alternate screen repaints continuously, so pacing
+     means a terminal that can never finish drawing. Noted for the future:
+     gating on `TermMode::ALT_SCREEN` would have saved it.
+  2. **The hidden "easter egg" era.** Developer: it's just a fun feature.
+     Removed the `hidden` flag entirely rather than leaving it `false`
+     everywhere — a concept nothing uses is one the next reader must rule
+     out.
+  3. **Bundled fonts.** VT323 was vendored (OFL, verified monospace, tests
+     that it resolved through *both* the picker and renderer paths), then
+     removed when the developer decided to recommend fonts instead. Avoids
+     150KB and third-party licence surface in every install.
+
+  **Two real bugs the developer's screenshot caught, both worth
+  remembering:**
+
+  - **"I'm not seeing a vignette."** Correct, and the cause was
+    arithmetic: a darkening-only vignette has nothing to act on when every
+    CRT theme's background is near-black (`Green Phosphor CRT` is
+    `#0b0f0b` — darkening 25% moves it 3 levels of 255). Fixed by *also*
+    lifting the centre with a faint glow in the theme foreground, which is
+    both what makes the darkening visible and what a real powered tube
+    does. Premultiplied blending (`src + dst*(1-src.a)`) lets one draw add
+    light via RGB and remove it via alpha.
+  - **Effects painted over pane title bars.** Fixed by drawing one
+    instanced quad per pane *content* rect, with coordinates still in
+    window space so panes share one continuous screen. Chrome is not part
+    of the illusion.
+
+  **A wgpu bug worth keeping:** adding `glow_color: vec3<f32>` to the
+  effects uniform failed at *draw time* with "bound with size 40 where the
+  shader expects 48" — WGSL aligns `vec3` to 16 bytes, so the shader put
+  it at offset 32 while Rust packed it at 24. Fixed with explicit padding
+  plus `const _: () = assert!(size_of::<EffectsUniform>() == 48)`, which
+  turns the next such mismatch into a build failure. **Uniform layout
+  mismatches are invisible to the compiler and to unit tests.**
+
+  **The hum bar is the project's first animated effect**, added at the
+  developer's request (mains ripple beating against vertical refresh).
+  It is therefore the first thing that stops an idle terminal sleeping —
+  the property the v1.5 idle-cost work exists to protect. Bounded three
+  ways: stops entirely on focus loss, redraws at 20fps rather than the
+  display rate (a 9-second drift is visually identical), and off at
+  `hum = 0`. **Measured, not assumed:** ~1.2% → ~2.7% of a core under
+  llvmpipe software rendering, which overstates it. Phase is computed on
+  the CPU as 0.0-1.0 rather than passed as elapsed seconds, because an
+  `f32` carrying uptime loses resolution after hours and the failure would
+  be invisible until someone left a terminal open long enough.
+
+  Also: `pane::retro` scans PTY output for a private `OSC 7331` so a shell
+  can set an era live (`printf '\e]7331;era=amber\a'`) — same hand-rolled
+  scanner shape as `pane::cwd`. Safe to accept from arbitrary output
+  because the payload is a **name, not a value**: it selects from curated
+  eras, so output cannot specify colors or hide text, and it never
+  persists.
+
+  323 tests, clippy clean native + Windows cross-target, all six eras
+  smoke-launched with zero wgpu validation errors.

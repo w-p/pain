@@ -310,6 +310,99 @@ monochrome and one cell wide on purpose. They have emoji forms in Unicode,
 but they're used constantly in build and test output, where turning them into
 colored pictures would be worse and would break their alignment.
 
+### Retro eras
+
+Off by default. An era is a period look — a specific machine, not a vague
+retro mood — bundling a palette, screen effects, a wire speed, and a font
+preference:
+
+```toml
+[retro]
+era = "bbs"
+```
+
+| Era | The machine |
+| --- | --- |
+| `green` | IBM 5151, 1981 — P1 green phosphor |
+| `amber` | Amber CRT, mid-1980s — P3 phosphor |
+| `cga` | IBM 5153, 1981 — the CGA 16 |
+| `bbs` | Dial-up BBS, ~1993 — the CGA palette ANSI art was drawn for |
+| `c64` | Commodore 64, 1982 — VIC-II blues |
+
+Pick one in Settings under **Retro**, or try one for a single session without
+touching your config:
+
+```sh
+pain --era=amber
+pain --era=list      # what's on offer
+```
+
+An era overrides your theme while it's active but never writes to it, so
+turning it off restores whatever you had. An explicitly set
+`background_color`, `scanlines`, or `vignette` still wins over the era —
+someone who chose a value meant it.
+
+You can also change era live, from a shell or a script:
+
+```sh
+printf '\e]7331;era=green\a'
+```
+
+That's session-only and never saved, and the payload is an era *name* rather
+than colours, so program output can't produce an unreadable screen.
+
+**Individual settings**, each following the era unless you set it:
+
+```toml
+[retro]
+era = "green"
+scanlines = 55    # 0-100
+vignette = 45     # 0-100
+hum = 30          # 0-100 — the drifting bar; see below
+```
+
+All three have sliders in Settings, each showing the era's value until you
+move it. A `↺` beside them hands control back to the era.
+
+The vignette does two things at once, because doing only one of them is
+invisible: it darkens toward the corners *and* lifts the centre with a faint
+glow in the theme's foreground colour. Every CRT palette has a near-black
+background, and darkening near-black by a quarter moves it three levels out of
+255 — so without something to darken there is nothing to see.
+
+**The hum bar** is the soft band that drifted slowly up an old monitor when
+its power supply and the mains supply were slightly out of step — the ripple
+beating against the vertical refresh. It takes about nine seconds to cross the
+screen.
+
+It's the only effect that moves, and so the only one that keeps the terminal
+drawing while it sits idle. That cost is bounded: it stops entirely when the
+window loses focus, and it redraws at a small fraction of your display's rate,
+since a bar that slow doesn't need sixty frames a second. Set `hum = 0` to get
+the idle cost back completely.
+
+Effects cover the terminal grid only. Pane title bars are chrome and are left
+alone.
+
+The effects are deliberately **static**: no animation, no time input. That
+means they cost one extra draw on a frame that was already being rendered, so
+an idle terminal still renders nothing and still sleeps. Animated effects
+(phosphor decay, flicker) would force continuous redraw and aren't here.
+
+Eras name period typefaces rather than bundling them, and use one if you have
+it installed. Nothing ships with pain, so this is a recommendation rather than
+a promise — the font makes more difference to a period look than the palette
+does, so it's worth installing one:
+
+| Era | Font | Where |
+| --- | --- | --- |
+| `green`, `amber`, `matrix` | VT323 | Google Fonts (OFL) |
+| `cga`, `bbs` | Px437 IBM VGA 8x16 | [int10h.org](https://int10h.org/oldschool-pc-fonts/) (CC BY-SA) |
+| `c64` | C64 Pro Mono | [style64.org](https://style64.org/c64-truetype) |
+
+Without one, an era still applies its palette and effects and keeps whatever
+font you've configured.
+
 ### Ligatures
 
 Off by default. When enabled, each row's text is shaped in runs so a font can

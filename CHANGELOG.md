@@ -2,6 +2,45 @@
 
 ## Unreleased
 
+- Retro eras, off by default. An era is a period look for a specific machine —
+  `green` (IBM 5151), `amber`, `cga` (IBM 5153), `bbs`, `c64` — bundling a
+  palette, scanlines, a curved-glass vignette, and a typeface. Set `[retro]
+  era`, pick one in Settings under **Retro**, or try one for a session with
+  `pain --era=amber`. `pain --era=list` shows what's available.
+
+  An era overrides your theme while active but never writes to it, so turning
+  it off restores what you had. Anything you set explicitly — background
+  colour, scanline or vignette strength — still wins over the era.
+
+  Scanlines and the vignette have sliders in Settings, each showing the era's
+  value until you move it, with a button to hand control back to the era.
+
+- Eras name period typefaces — VT323 for the phosphor eras, `Px437 IBM VGA
+  8x16` for the DOS ones, C64 Pro Mono for `c64` — and use one if it's
+  installed. None are bundled; the README says where to get them. The font
+  makes more difference to a period look than the palette does, so it's worth
+  installing one.
+
+- A drifting **hum bar**, the soft band that crept up an old monitor when its
+  power supply and the mains were slightly out of step. It's the only effect
+  that moves, and so the only one that keeps the terminal drawing while idle —
+  it stops when the window loses focus, redraws well below your display's
+  rate, and `hum = 0` turns it off entirely.
+
+- Eras can also be set live by a shell or script, with this terminal's own
+  escape sequence:
+
+  ```sh
+  printf '\e]7331;era=green\a'
+  ```
+
+  Session-only and never saved, and the payload is an era name rather than
+  colours — so program output can't leave you with an unreadable screen.
+
+- The scanline and vignette effects are static: they add one draw to a frame
+  that was already being rendered, so with the hum bar off an idle terminal
+  still renders nothing and still sleeps.
+
 ## v1.10.0
 
 - The process scan behind the pane title bars now collects only what those

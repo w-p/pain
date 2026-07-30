@@ -6,7 +6,9 @@ mod glyph;
 
 use bytemuck::{Pod, Zeroable};
 
-pub use glyph::{GlyphRasterizer, RasterizedGlyph, ShapedGlyph, monospace_font_families, system_ui_font_data};
+pub use glyph::{
+    GlyphRasterizer, RasterizedGlyph, ShapedGlyph, first_installed_family, monospace_font_families, system_ui_font_data,
+};
 
 /// Measures a font's cell size at `font_size_px` in `font_family` (`""` or
 /// `"monospace"` for the system default): the advance width of a
@@ -41,6 +43,89 @@ struct Instance {
     /// `u32` flag so the vertex format stays uniformly `Float32*` — there is
     /// exactly one bit of information here and nowhere to grow.
     colored: f32,
+}
+
+/// Screen effects to draw over the finished grid. All strengths are 0.0–1.0,
+/// and all-zero means nothing is drawn at all.
+///
+/// These are deliberately *static* — no time input, nothing animated. That is
+/// what makes them free: they add one draw call to a frame that was going to
+/// be rendered anyway, so an idle terminal still renders nothing and still
+/// sleeps. Anything animated (phosphor decay, flicker, rain) would force
+/// continuous redraw and belongs behind its own separate opt-in.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Effects {
+    pub scanlines: f32,
+    pub vignette: f32,
+    /// Strength of the drifting mains-hum bar, 0.0–1.0.
+    ///
+    /// **The only animated effect.** Everything else here is static and so
+    /// costs nothing on an idle terminal; this one requires the caller to
+    /// keep rendering. See `hum_phase`.
+    pub hum: f32,
+    /// Where the hum bar currently sits, 0.0–1.0, wrapping.
+    ///
+    /// A phase rather than a timestamp, computed by the caller. Handing the
+    /// shader raw elapsed seconds would lose precision in `f32` after a few
+    /// hours of uptime; a value that always stays inside one cycle never
+    /// does.
+    pub hum_phase: f32,
+    /// Physical pixels per light/dark scanline cycle. Scaled by the caller to
+    /// the display, so scanlines look the same density on a HiDPI screen as
+    /// on a 1x one.
+    pub scanline_period: f32,
+    /// The theme's foreground, in sRGB — the phosphor color the vignette's
+    /// ambient lift is tinted with. See `effects.wgsl`.
+    pub glow_color: [f32; 3],
+}
+
+impl Effects {
+    /// Whether there is anything to draw. The renderer skips the whole pass
+    /// when there isn't, so the default path costs nothing.
+    pub fn is_empty(&self) -> bool {
+        self.scanlines <= 0.0 && self.vignette <= 0.0 && self.hum <= 0.0
+    }
+
+    /// Whether anything here needs the frame redrawn to keep moving. Only the
+    /// hum bar does; the caller uses this to decide whether the terminal may
+    /// go back to sleep.
+    pub fn is_animated(&self) -> bool {
+        self.hum > 0.0
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct EffectsUniform {
+    screen_size: [f32; 2],
+    scanline_strength: f32,
+    scanline_period: f32,
+    vignette_strength: f32,
+    opacity: f32,
+    // These two occupy what was padding. WGSL aligns a `vec3<f32>` to 16
+    // bytes, so `glow_color` sits at offset 32 either way — the eight bytes
+    // before it were dead space, and filling them keeps the uniform at the
+    // same size. The mismatch this padding originally fixed is rejected by
+    // wgpu only at draw time ("bound with size 40 where the shader expects
+    // 48"); the assertion below turns it into a build failure instead.
+    hum_strength: f32,
+    hum_phase: f32,
+    glow_color: [f32; 3],
+    _padding: f32,
+}
+
+/// The layout the shader's `Effects` struct expects. A field added to either
+/// side without the other fails here rather than at the first draw.
+const _: () = assert!(std::mem::size_of::<EffectsUniform>() == 48);
+
+/// A region the screen effects cover — a pane's *content* rect, excluding its
+/// title bar. One instance per area; see `effects.wgsl` for why this isn't
+/// simply the whole window.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct EffectArea {
+    pos: [f32; 2],
+    size: [f32; 2],
 }
 
 #[repr(C)]
@@ -94,6 +179,14 @@ pub struct GridRenderer {
     globals_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     atlas: atlas::GlyphAtlas,
+    /// Separate pipeline for the fullscreen effects overlay: it takes only
+    /// the quad vertex buffer and its own uniform, not the grid's instance
+    /// buffer or texture bindings.
+    effects_pipeline: wgpu::RenderPipeline,
+    effects_buffer: wgpu::Buffer,
+    effects_bind_group: wgpu::BindGroup,
+    effects_area_vbo: wgpu::Buffer,
+    effects_area_capacity: usize,
 }
 
 impl GridRenderer {
@@ -255,7 +348,110 @@ impl GridRenderer {
             mapped_at_creation: false,
         });
 
-        Self { pipeline, quad_vbo, instance_vbo, instance_capacity, globals_buffer, bind_group, atlas }
+        // Effects overlay: its own shader, uniform and pipeline, sharing only
+        // the quad vertex buffer. Kept separate rather than folded into the
+        // grid pipeline because it needs neither the instance buffer nor the
+        // atlas bindings, and because a pass that draws nothing should cost
+        // nothing to skip.
+        let effects_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("effects-shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("effects.wgsl").into()),
+        });
+
+        let effects_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("effects-uniform"),
+            size: std::mem::size_of::<EffectsUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let effects_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("effects-bind-group-layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        let effects_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("effects-bind-group"),
+            layout: &effects_layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: effects_buffer.as_entire_binding() }],
+        });
+
+        let effects_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("effects-pipeline"),
+            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("effects-pipeline-layout"),
+                bind_group_layouts: &[Some(&effects_layout)],
+                immediate_size: 0,
+            })),
+            vertex: wgpu::VertexState {
+                module: &effects_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<QuadVertex>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &wgpu::vertex_attr_array![0 => Float32x2],
+                    },
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<EffectArea>() as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &wgpu::vertex_attr_array![1 => Float32x2, 2 => Float32x2],
+                    },
+                ],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &effects_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    // Same premultiplied blending as the grid — the overlay
+                    // emits black at an alpha, which composites to a straight
+                    // darkening of whatever is already there.
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        // One area per visible pane, which is far more than any real layout.
+        let effects_area_capacity = 256;
+        let effects_area_vbo = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("effects-area-vbo"),
+            size: (effects_area_capacity * std::mem::size_of::<EffectArea>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        Self {
+            pipeline,
+            quad_vbo,
+            instance_vbo,
+            instance_capacity,
+            globals_buffer,
+            bind_group,
+            atlas,
+            effects_pipeline,
+            effects_buffer,
+            effects_bind_group,
+            effects_area_vbo,
+            effects_area_capacity,
+        }
     }
 
     /// Clears `view` to `background` and draws `rects` (cursors, dividers)
@@ -273,12 +469,46 @@ impl GridRenderer {
         rects: impl Iterator<Item = SolidRect>,
         glyphs: impl Iterator<Item = GlyphCell>,
         runs: impl Iterator<Item = GlyphRun>,
+        effects: Effects,
+        // Where the effects apply — the panes' content rects, as
+        // `(x, y, width, height)`. Title bars are left out by the caller.
+        effect_areas: &[(f32, f32, f32, f32)],
     ) {
         queue.write_buffer(
             &self.globals_buffer,
             0,
             bytemuck::bytes_of(&Globals { screen_size: [screen_size.0 as f32, screen_size.1 as f32] }),
         );
+
+        let effect_areas: Vec<EffectArea> = if effects.is_empty() {
+            Vec::new()
+        } else {
+            effect_areas
+                .iter()
+                .take(self.effects_area_capacity)
+                .map(|&(x, y, width, height)| EffectArea { pos: [x, y], size: [width, height] })
+                .collect()
+        };
+        if !effect_areas.is_empty() {
+            queue.write_buffer(
+                &self.effects_buffer,
+                0,
+                bytemuck::bytes_of(&EffectsUniform {
+                    screen_size: [screen_size.0 as f32, screen_size.1 as f32],
+                    scanline_strength: effects.scanlines,
+                    // Guarded: a zero or negative period would divide by zero
+                    // in the shader and paint the whole window black.
+                    scanline_period: effects.scanline_period.max(1.0),
+                    vignette_strength: effects.vignette,
+                    opacity: background.a as f32,
+                    hum_strength: effects.hum,
+                    hum_phase: effects.hum_phase,
+                    glow_color: effects.glow_color,
+                    _padding: 0.0,
+                }),
+            );
+            queue.write_buffer(&self.effects_area_vbo, 0, bytemuck::cast_slice(&effect_areas));
+        }
 
         let mut instances = Vec::new();
 
@@ -378,6 +608,18 @@ impl GridRenderer {
                 pass.set_vertex_buffer(0, self.quad_vbo.slice(..));
                 pass.set_vertex_buffer(1, self.instance_vbo.slice(..));
                 pass.draw(0..4, 0..instances.len() as u32);
+            }
+
+            // Over the finished grid, and still inside this pass — so the
+            // egui chrome, which renders in its own pass afterwards, stays
+            // crisp and unshaded. A warped or scanlined settings panel would
+            // be unusable, and the chrome isn't part of the illusion.
+            if !effect_areas.is_empty() {
+                pass.set_pipeline(&self.effects_pipeline);
+                pass.set_bind_group(0, &self.effects_bind_group, &[]);
+                pass.set_vertex_buffer(0, self.quad_vbo.slice(..));
+                pass.set_vertex_buffer(1, self.effects_area_vbo.slice(..));
+                pass.draw(0..4, 0..effect_areas.len() as u32);
             }
         }
 

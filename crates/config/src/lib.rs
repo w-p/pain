@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+pub mod era;
 pub mod themes;
 
 /// Directory name under the platform's config root — a working name (the
@@ -31,6 +32,9 @@ pub const MAX_FONT_SIZE: u32 = 48;
 /// `transparency` is a percentage: 0 is fully transparent, 100 fully
 /// opaque.
 pub const MAX_TRANSPARENCY: u32 = 100;
+/// Effect strengths are percentages: 0 is off, 100 is as strong as the
+/// effect goes.
+pub const MAX_EFFECT: u32 = 100;
 /// A ceiling on retained history per pane. Scrollback is allocated as it
 /// fills rather than up front, so this bounds how much memory a pane can
 /// eventually reach, not what it starts at.
@@ -42,6 +46,7 @@ pub struct Config {
     pub general: General,
     pub appearance: Appearance,
     pub cursor: Cursor,
+    pub retro: Retro,
     /// Chord string (e.g. `"ctrl shift e"`) to action name (e.g.
     /// `"split_vertical"`), overriding the built-in Terminator-equivalent
     /// keymap. `BTreeMap` rather than `HashMap` so `Config::save` writes a
@@ -308,6 +313,131 @@ fn parse_hex_rgb(s: &str) -> Option<[f32; 3]> {
     Some([channel(0..2)?, channel(2..4)?, channel(4..6)?])
 }
 
+/// Period looks, off by default. See [`era`] for what an era is and why the
+/// list has something missing from it.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Retro {
+    /// Name of an era (see [`era::ERAS`]). **Empty is the default and means
+    /// off** — byte-for-byte the same rendering as if this section did not
+    /// exist.
+    ///
+    /// An active era overrides `appearance.theme` with its own palette. It
+    /// never writes to it: turning the era off restores whatever theme was
+    /// chosen, so trying one on cannot lose a setting. An unrecognised name
+    /// is treated as off rather than failing the load, the same convention
+    /// as every other name in this file.
+    pub era: String,
+    /// Scanline strength, 0-100. Absent follows the era; `0` turns them off
+    /// while keeping the rest of it.
+    pub scanlines: Option<u32>,
+    /// Corner darkening, 0-100. Absent follows the era.
+    pub vignette: Option<u32>,
+    /// Strength of the drifting mains-hum bar, 0-100. Absent follows the era.
+    ///
+    /// **This is the only effect that animates**, and so the only one that
+    /// stops an idle terminal from sleeping. The cost is bounded — it stops
+    /// entirely when the window isn't focused, and redraws at a fraction of
+    /// the display's rate, since the bar takes seconds to cross the screen —
+    /// but `0` is how you get the sleep back completely.
+    pub hum: Option<u32>,
+}
+
+/// The 16 ANSI colors of `theme`, as 0.0–1.0 RGB.
+///
+/// Free functions rather than methods because a caller may hold a theme that
+/// came from somewhere other than a `Config` — a session-only era override,
+/// for instance — and shouldn't have to fabricate a `Config` to unpack it.
+pub fn palette_of(theme: &themes::Theme) -> [[f32; 3]; 16] {
+    theme.ansi.map(unpack_rgb)
+}
+
+/// What a cell left at its default foreground resolves to under `theme`.
+pub fn foreground_of(theme: &themes::Theme) -> [f32; 3] {
+    unpack_rgb(theme.foreground)
+}
+
+/// `theme`'s own background.
+pub fn background_of(theme: &themes::Theme) -> [f32; 3] {
+    unpack_rgb(theme.background)
+}
+
+/// An explicit `background_color`, if one is set and parses. `None` means
+/// "follow whichever theme is in effect".
+pub fn background_override(appearance: &Appearance) -> Option<[f32; 3]> {
+    parse_hex_rgb(&appearance.background_color)
+}
+
+impl Config {
+    /// The theme actually in effect. An active era's palette overrides the
+    /// chosen theme.
+    ///
+    /// This is an *overlay*, not an assignment: `appearance.theme` is left
+    /// exactly as the user set it, so turning an era off restores their
+    /// theme and trying one on can never lose a setting. That's why callers
+    /// go through here rather than through `appearance` directly.
+    pub fn effective_theme(&self) -> &'static themes::Theme {
+        if let Some(era) = self.retro.resolved_era()
+            && let Some(theme) = themes::find(era.theme)
+        {
+            return theme;
+        }
+        self.appearance.resolved_theme()
+    }
+
+    /// The 16 ANSI colors in effect, era included.
+    pub fn palette(&self) -> [[f32; 3]; 16] {
+        self.effective_theme().ansi.map(unpack_rgb)
+    }
+
+    /// What a cell left at its default foreground resolves to, era included.
+    pub fn foreground_rgb(&self) -> [f32; 3] {
+        unpack_rgb(self.effective_theme().foreground)
+    }
+
+    /// The effective terminal background. An explicit
+    /// `appearance.background_color` still wins over both era and theme —
+    /// someone who pinned their background meant it.
+    pub fn background_rgb(&self) -> [f32; 3] {
+        parse_hex_rgb(&self.appearance.background_color)
+            .unwrap_or_else(|| unpack_rgb(self.effective_theme().background))
+    }
+}
+
+impl Retro {
+    /// The era in effect, or `None` when off or unrecognised.
+    pub fn resolved_era(&self) -> Option<&'static era::Era> {
+        era::find(&self.era)
+    }
+
+    /// Effective scanline strength, 0-100.
+    pub fn scanlines(&self) -> u32 {
+        self.resolve(self.scanlines, |era| era.scanlines).min(MAX_EFFECT)
+    }
+
+    /// Effective corner darkening, 0-100.
+    pub fn vignette(&self) -> u32 {
+        self.resolve(self.vignette, |era| era.vignette).min(MAX_EFFECT)
+    }
+
+    /// Effective hum-bar strength, 0-100.
+    pub fn hum(&self) -> u32 {
+        self.resolve(self.hum, |era| era.hum).min(MAX_EFFECT)
+    }
+
+    /// Explicit setting if there is one, else the era's value, else zero.
+    ///
+    /// The one place the "absent follows the bundle" rule lives, so a new
+    /// era-backed setting can't accidentally resolve differently from the
+    /// others.
+    fn resolve(&self, explicit: Option<u32>, from_era: impl Fn(&era::Era) -> u32) -> u32 {
+        match explicit {
+            Some(value) => value,
+            None => self.resolved_era().map_or(0, from_era),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Cursor {
@@ -529,6 +659,78 @@ mod tests {
         assert_eq!(config.keybindings.get("ctrl+shift+e"), Some(&"split_vertical".to_string()));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn retro_is_off_by_default_and_changes_nothing() {
+        let retro = Retro::default();
+        assert!(retro.resolved_era().is_none());
+        assert_eq!(retro.scanlines(), 0);
+        assert_eq!(retro.vignette(), 0);
+        assert_eq!(retro.hum(), 0, "nothing animates by default, so an idle terminal still sleeps");
+    }
+
+    /// An era supplies every retro setting that isn't spelled out, which is
+    /// what makes `era = "bbs"` a complete look rather than a colour scheme.
+    #[test]
+    fn an_era_supplies_the_settings_that_are_absent() {
+        let retro = Retro { era: "bbs".to_string(), ..Default::default() };
+        let era = era::find("bbs").expect("bbs exists");
+
+        assert_eq!(retro.scanlines(), era.scanlines);
+        assert_eq!(retro.vignette(), era.vignette);
+        assert!(era.scanlines > 0, "an era has to change something a plain theme can't");
+    }
+
+    /// Explicit beats the era, including explicit zero — "this era but
+    /// without the scanlines" has to be expressible.
+    #[test]
+    fn an_explicit_setting_overrides_the_era_including_zero() {
+        let retro = Retro { era: "bbs".to_string(), scanlines: Some(0), ..Default::default() };
+
+        assert_eq!(retro.scanlines(), 0, "an explicit 0 must turn the effect off, not fall through to the era");
+        assert_eq!(retro.vignette(), era::find("bbs").unwrap().vignette, "unset still follows the era");
+    }
+
+    #[test]
+    fn an_unknown_era_behaves_as_off() {
+        let retro = Retro { era: "nineteen-eighty-four".to_string(), ..Default::default() };
+        assert!(retro.resolved_era().is_none());
+        assert_eq!(retro.scanlines(), 0);
+    }
+
+    #[test]
+    fn effect_strengths_are_clamped_to_the_documented_range() {
+        let retro = Retro { scanlines: Some(4000), vignette: Some(999), ..Default::default() };
+        assert_eq!(retro.scanlines(), MAX_EFFECT);
+        assert_eq!(retro.vignette(), MAX_EFFECT);
+    }
+
+    /// The era overlays the theme without touching it, so turning the era off
+    /// restores whatever the user actually chose.
+    #[test]
+    fn an_era_overlays_the_theme_without_overwriting_it() {
+        let mut config = Config::default();
+        config.appearance.theme = "Dracula".to_string();
+        let chosen = config.effective_theme().name;
+
+        config.retro.era = "green".to_string();
+        assert_eq!(config.effective_theme().name, "Green Phosphor CRT");
+        assert_eq!(config.appearance.theme, "Dracula", "the era must not rewrite the chosen theme");
+
+        config.retro.era.clear();
+        assert_eq!(config.effective_theme().name, chosen, "turning the era off restores the theme");
+    }
+
+    /// A pinned background is a deliberate choice and outranks an era, the
+    /// same way it already outranks a theme.
+    #[test]
+    fn an_explicit_background_still_wins_over_an_era() {
+        let mut config = Config::default();
+        config.retro.era = "green".to_string();
+        config.appearance.background_color = "#123456".to_string();
+
+        assert_eq!(config.background_rgb(), parse_hex_rgb("#123456").unwrap());
     }
 
     #[test]

@@ -344,6 +344,16 @@ fn family_attr(name: &str) -> Family<'_> {
     if name.is_empty() || name.eq_ignore_ascii_case("monospace") { Family::Monospace } else { Family::Name(name) }
 }
 
+/// The first of `wanted` that is actually installed, or `None`.
+///
+/// Case-insensitive, and matched against the same font database the pickers
+/// read, so a name that resolves here really will render. Used for era fonts,
+/// which are named rather than bundled — see `config::era`.
+pub fn first_installed_family(wanted: &[&'static str]) -> Option<&'static str> {
+    let installed = monospace_font_families();
+    wanted.iter().copied().find(|name| installed.iter().any(|have| have.eq_ignore_ascii_case(name)))
+}
+
 /// Every monospaced font family installed on the system, deduplicated and
 /// sorted — for the settings panel's font picker. Scans the system font
 /// database on first call only (a real, if one-time, disk/registry scan),
