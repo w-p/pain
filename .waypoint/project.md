@@ -105,42 +105,51 @@ baseline plus usage-proportional scrollback; full breakdown in the memory
 log. Settings window not yet verified on real hardware at release time —
 developer chose to ship and test from the release.
 
-**Settings window blank on macOS (reported 2026-07-31, fix in v1.11.1 —
-UNCONFIRMED).** The developer reported the settings window's content
-completely empty on Mac. Established by reading rather than guessing:
-`settings_window.rs` is byte-identical between v1.10.0 and v1.11.0, so the
-retro work is not implicated; and the terminal window's own egui chrome
-(the context menu used to *reach* Settings) renders fine there, so egui,
-fonts and the chrome context all work. What is different is specifically
-the second OS window, introduced in v1.10.0 and shipped without
-real-hardware verification.
+**Settings window blank on macOS — diagnosed and fixed in v1.11.2.** The
+developer reported the settings window's content completely empty on Mac.
+Two attempts; the first was wrong, and how it was wrong is the useful part.
 
-Fixed two genuine robustness holes that fit the symptom, without being
-able to reproduce it:
+**v1.11.1 (wrong fix).** Hypothesis: the window repaints only on
+`RedrawRequested`, so a first frame rendered at a degenerate size would
+leave it blank forever. Shipped as a robustness fix with instrumentation
+attached (`--settings` to open the window in one command, plus verbose
+diagnostics), explicitly labelled unconfirmed. It did not fix it — but the
+instrumentation is what produced the diagnosis, so it earned its place.
 
-1. The window repaints only on `RedrawRequested` — at open, on `Resized`,
-   and while egui animates. A first frame that rendered nothing had
-   nothing to rescue it and stayed blank permanently. Windows and Linux
-   almost always get a `Resized` after creation, which covered this up by
-   accident; a platform creating the window at exactly the requested size
-   sends none. It now retries until a frame renders content, capped at 120
-   frames, then reports on stderr rather than repainting forever.
-2. The surface was configured once at creation and thereafter only by
-   `Resized`, so the surface size and window size could silently diverge.
-   Now re-synced whenever they differ.
+**The actual cause.** `settings_window::redraw` ran egui *first* and
+acquired the surface *second*. On macOS the first `get_current_texture`
+for a freshly created window routinely returns `Outdated`; that path
+returned early, discarding `full_output.textures_delta`. egui hands a
+texture delta over exactly once — it is considered delivered the moment
+`run_ui` returns — so the renderer never received egui's font atlas
+(`Managed(0)`). Every later frame drew text against a texture it did not
+have: background painted, glyphs absent, hence "completely empty". The
+`Missing texture: Managed(0)` warnings in the log are that, and the
+eventual panic ("Tried to update a texture that has not been allocated
+yet") is egui sending an *incremental* atlas update for a texture the
+renderer never allocated.
 
-**This is unconfirmed against the actual report** — the developer's Mac
-test loop is slow and the decisive question (does resizing the window make
-content appear?) was never answered. What the release *does* guarantee is
-that the next attempt produces evidence: `pain --settings --verbose=general`
-prints which of four things happened, and each points somewhere specific.
-Printing nothing at all would be the most informative outcome, meaning the
-window never redraws on macOS and this fix addressed the wrong mechanism.
+**Why only macOS, and why the terminal window was fine:** `Graphics::redraw`
+acquires its surface *before* running egui, so a dropped frame there
+returns before any deltas exist. The settings window was the only place
+with the opposite order. Both now carry comments saying not to reorder them.
 
-`--settings` was added in the same pass: it opens the settings window at
-startup, so reproducing a report about it is one command rather than three
-interactions. It is also how the fix was verified here at all (Linux
-reports `first content rendered at 460x720 after 0 retries`).
+**Reproduced on Linux before shipping**, by forcing the first frame to take
+the dropped-surface path: old ordering produced 8 `Missing texture`
+warnings, fixed ordering produced 0. That turned a reasoned fix into a
+verified one without needing a Mac.
+
+Also fixed in passing: the dropped-surface paths returned without asking
+for another frame (a window that repaints only on request could stop
+drawing entirely), and dropped the texture *free* list, leaking a texture
+per dropped frame.
+
+**Lesson worth keeping: instrument so the next attempt produces evidence.**
+The v1.11.1 diagnostics are what made this diagnosable at all — and note
+that `first content rendered ... after 0 retries` was *misleading on its
+own*: primitives were non-empty, they simply referenced a missing texture.
+A "did it render?" check that only counts geometry cannot see this class of
+failure.
 
 **Distribution is fully automated.** Pushing a `v*` tag runs
 `.github/workflows/release.yml`, which builds four targets, publishes a

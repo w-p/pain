@@ -241,19 +241,54 @@ impl SettingsWindow {
         });
         self.state.handle_platform_output(&self.window, full_output.platform_output.clone());
 
-        // Same treatment as the terminal window's `redraw`: a lost or
-        // outdated surface is transient (a resize mid-frame, the window
-        // moving between monitors), so reconfigure and let the next frame
-        // draw it rather than treating it as an error.
+        // Applied *before* the surface is touched, and this ordering is
+        // load-bearing.
+        //
+        // egui hands a texture delta over exactly once: it considers it
+        // delivered the moment `run_ui` returns and never sends it again.
+        // Dropping the deltas on an early return therefore leaves this
+        // renderer permanently without egui's font atlas (`Managed(0)`) —
+        // every later frame's text references a texture it does not have, so
+        // the window paints its background and nothing else, and the first
+        // incremental atlas update after that panics inside `update_texture`
+        // with "Tried to update a texture that has not been allocated yet".
+        //
+        // That is exactly what happened on macOS, where the first
+        // `get_current_texture` for a freshly created window routinely
+        // returns `Outdated`. The terminal window never hit it only because
+        // it acquires its surface *before* running egui, so a failed
+        // acquisition returns before any deltas exist. Do not reorder either
+        // of them.
+        for (id, delta) in &full_output.textures_delta.set {
+            self.renderer.update_texture(device, queue, *id, delta);
+        }
+
+        // A lost or outdated surface is transient (a resize mid-frame, the
+        // window moving between monitors), so reconfigure and let the next
+        // frame draw it rather than treating it as an error.
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(device, &self.config);
+                // Ask for another frame — nothing else will. This used to
+                // return silently, which on a window that repaints only when
+                // asked could stop it drawing altogether.
+                self.request_settle_redraw();
+                self.free_textures(&full_output.textures_delta);
                 return outcome;
             }
-            wgpu::CurrentSurfaceTexture::Timeout
-            | wgpu::CurrentSurfaceTexture::Occluded
-            | wgpu::CurrentSurfaceTexture::Validation => return outcome,
+            wgpu::CurrentSurfaceTexture::Timeout => {
+                self.request_settle_redraw();
+                self.free_textures(&full_output.textures_delta);
+                return outcome;
+            }
+            // Not retried: an occluded window is deliberately not drawing and
+            // will get events again when it is shown, and a validation error
+            // is not going to fix itself on the next frame.
+            wgpu::CurrentSurfaceTexture::Occluded | wgpu::CurrentSurfaceTexture::Validation => {
+                self.free_textures(&full_output.textures_delta);
+                return outcome;
+            }
         };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("settings") });
@@ -262,9 +297,6 @@ impl SettingsWindow {
         let screen_descriptor =
             egui_wgpu::ScreenDescriptor { size_in_pixels: [self.config.width, self.config.height], pixels_per_point };
         let primitives = self.ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
-        for (id, delta) in &full_output.textures_delta.set {
-            self.renderer.update_texture(device, queue, *id, delta);
-        }
         let buffers = self.renderer.update_buffers(device, queue, &mut encoder, &primitives, &screen_descriptor);
         if !buffers.is_empty() {
             queue.submit(buffers);
@@ -289,9 +321,7 @@ impl SettingsWindow {
             let mut pass = pass.forget_lifetime();
             self.renderer.render(&mut pass, &primitives, &screen_descriptor);
         }
-        for id in &full_output.textures_delta.free {
-            self.renderer.free_texture(id);
-        }
+        self.free_textures(&full_output.textures_delta);
         queue.submit(Some(encoder.finish()));
         self.window.pre_present_notify();
         frame.present();
@@ -330,6 +360,17 @@ impl SettingsWindow {
         }
 
         outcome
+    }
+
+    /// Releases textures egui has finished with.
+    ///
+    /// Called on every path out of `redraw`, including the ones that give up
+    /// on the surface — the free list is handed over once, same as the
+    /// allocation list, so skipping it leaks a texture per dropped frame.
+    fn free_textures(&mut self, delta: &egui::TexturesDelta) {
+        for id in &delta.free {
+            self.renderer.free_texture(id);
+        }
     }
 
     /// Asks for another frame while the window has yet to render content.

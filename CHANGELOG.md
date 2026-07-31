@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Fixed, macOS: the settings window opened completely empty, and could then
+  crash. The window ran its interface and *then* asked for somewhere to draw
+  it — and on macOS that request routinely fails the first time for a window
+  that has just been created. Taking that path threw away the font texture
+  that had been prepared alongside the frame, and it is only ever offered
+  once, so from then on every character was drawn using a texture that was
+  never received: the window painted its background and nothing else.
+
+  The terminal window asks for somewhere to draw *before* it builds a frame,
+  which is why its own menus were unaffected on the same machine.
+
+  Also fixed alongside it: those failed frames neither asked for another
+  attempt — so a window could stop drawing entirely — nor released the
+  textures they were finished with.
+
 ## v1.11.1
 
 - Fixed: the settings window could open blank and stay that way. It repaints

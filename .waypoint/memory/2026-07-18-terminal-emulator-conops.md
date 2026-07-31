@@ -4486,3 +4486,48 @@
   mechanism. Shipped **unconfirmed** and said so plainly.
 
   326 tests, clippy clean native + Windows cross-target.
+
+  **Update — 2026-07-31, continued: the real macOS settings bug (v1.11.2).**
+  The v1.11.1 fix was **wrong** and the developer's log said so precisely.
+
+  `settings: first content rendered at 920x1440 after 0 retries` —
+  correctly sized, geometry produced, no retries needed. My whole
+  hypothesis (degenerate first frame, nothing to prompt a redraw) was
+  disproved by the instrumentation I had just added. Good outcome: the
+  round-trip cost one release but returned a diagnosis instead of another
+  guess.
+
+  **Actual cause, from `Missing texture: Managed(0)` in the log:**
+  `settings_window::redraw` ran egui first and acquired the surface second.
+  On macOS the first `get_current_texture` for a freshly created window
+  routinely returns `Outdated`; that arm returned early and **discarded
+  `full_output.textures_delta`**. egui hands deltas over exactly once — they
+  are consumed when `run_ui` returns and never resent — so the renderer
+  never got egui's font atlas. Every later frame drew text against a
+  texture it did not have: background painted, no glyphs, "completely
+  empty". The panic ("Tried to update a texture that has not been allocated
+  yet") is egui later sending an *incremental* atlas update for a texture
+  that was never allocated in that renderer.
+
+  **Why the terminal window never hit it:** `Graphics::redraw` acquires its
+  surface *before* running egui, so a dropped frame returns before any
+  deltas exist. Pure ordering luck. Both files now carry "do not reorder"
+  comments explaining the coupling.
+
+  **Reproduced it on Linux rather than shipping on reasoning again**: forced
+  the first frame down the dropped-surface path and compared orderings —
+  old order 8 `Missing texture` warnings, new order 0. A/B on the actual
+  mechanism, no Mac required.
+
+  **Two lessons worth carrying:**
+  1. **Instrument so the next attempt yields evidence.** `--settings` plus
+     the verbose lines cost little and converted an unfalsifiable guess
+     into a one-line diagnosis.
+  2. **"Did it render?" checks that only count geometry are blind to this
+     class of bug.** `first content rendered ... after 0 retries` was
+     literally true and completely misleading: primitives existed, they
+     just pointed at a texture the renderer lacked.
+
+  Also fixed: the dropped-surface arms returned without requesting another
+  frame (a window that repaints only on request could stop drawing), and
+  dropped the texture *free* list, leaking one texture per dropped frame.

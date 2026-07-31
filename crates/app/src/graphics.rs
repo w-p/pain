@@ -1993,6 +1993,14 @@ impl Graphics {
     /// GPU work unconditionally, so callers should only reach it when
     /// something actually needs repainting.
     pub fn redraw(&mut self) -> bool {
+        // The surface is acquired *before* egui runs (`self.ui.show` further
+        // down), and that ordering matters: the early returns below discard
+        // the frame, and egui hands its texture deltas over exactly once. If
+        // egui ran first, a dropped frame would take the font atlas
+        // allocation with it and this window would render text against a
+        // texture the renderer never received — blank output, then a panic on
+        // the next incremental atlas update. The settings window had exactly
+        // that bug (see `settings_window::redraw`). Do not reorder.
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
