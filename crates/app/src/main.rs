@@ -99,6 +99,14 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Opens the settings window immediately instead of needing a right-click
+    // and a menu. Exists because that window is a second OS window with its
+    // own surface and egui context, which is exactly the sort of thing that
+    // behaves differently per platform — and reproducing a report about it
+    // shouldn't require three interactions on a machine someone had to go and
+    // find.
+    let open_settings = args.iter().any(|a| a == "--settings");
+
     let event_loop = build_event_loop()?;
     // Sleep between events rather than spinning. PTY output arrives on
     // background threads, which wake the loop through `waker::Waker`;
@@ -107,7 +115,8 @@ fn main() -> anyhow::Result<()> {
     // foreground-process scan that keeps pane titles current).
     event_loop.set_control_flow(ControlFlow::Wait);
 
-    let mut app = App { waker: Some(waker::Waker::new(event_loop.create_proxy())), startup_era, ..App::default() };
+    let mut app =
+        App { waker: Some(waker::Waker::new(event_loop.create_proxy())), startup_era, open_settings, ..App::default() };
     event_loop.run_app(&mut app)?;
     Ok(())
 }
@@ -128,6 +137,8 @@ Options:
   -h, --help              Print this help and exit
   -V, --version           Print the version and exit
   -v, --verbose[=LIST]    Enable diagnostic logging on stderr
+      --era=NAME          Use a retro era for this session (--era=list to see them)
+      --settings          Open the settings window at startup
 
 Verbose categories, comma-separated. The bare flag enables `general`
 alone; the rest are high-frequency and would drown it out:
@@ -269,6 +280,8 @@ struct App {
     /// An era from `--era`, applied once the window exists. Session-only, so
     /// it never reaches the config file.
     startup_era: Option<&'static config::era::Era>,
+    /// Whether `--settings` asked for the settings window at startup.
+    open_settings: bool,
 }
 
 /// How close together in time two presses must be to count as a
@@ -406,6 +419,9 @@ impl ApplicationHandler for App {
             Ok(mut graphics) => {
                 if let Some(era) = startup_era {
                     graphics.set_era_override(Some(era));
+                }
+                if self.open_settings {
+                    graphics.open_settings_window(event_loop);
                 }
                 graphics.window().request_redraw();
                 self.graphics = Some(graphics);

@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Fixed: the settings window could open blank and stay that way. It repaints
+  only when something asks it to — when it opens, when it is resized, and
+  while a widget is animating — so a first frame that rendered nothing had
+  nothing to rescue it. On Windows and Linux a resize almost always follows
+  window creation and covered this up by accident; a platform that creates
+  the window at exactly the requested size sends none.
+
+  It now keeps asking for frames until one actually renders, and re-points
+  the surface at the window whenever the two disagree about its size. If it
+  still can't render after a couple of seconds it says so on stderr rather
+  than repainting silently forever.
+
+- `--settings` opens the settings window at startup, instead of needing a
+  right-click and a menu entry to get to it.
+
 ## v1.11.0
 
 - Retro eras, off by default. An era is a period look for a specific machine —

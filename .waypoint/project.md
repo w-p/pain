@@ -105,6 +105,43 @@ baseline plus usage-proportional scrollback; full breakdown in the memory
 log. Settings window not yet verified on real hardware at release time —
 developer chose to ship and test from the release.
 
+**Settings window blank on macOS (reported 2026-07-31, fix in v1.11.1 —
+UNCONFIRMED).** The developer reported the settings window's content
+completely empty on Mac. Established by reading rather than guessing:
+`settings_window.rs` is byte-identical between v1.10.0 and v1.11.0, so the
+retro work is not implicated; and the terminal window's own egui chrome
+(the context menu used to *reach* Settings) renders fine there, so egui,
+fonts and the chrome context all work. What is different is specifically
+the second OS window, introduced in v1.10.0 and shipped without
+real-hardware verification.
+
+Fixed two genuine robustness holes that fit the symptom, without being
+able to reproduce it:
+
+1. The window repaints only on `RedrawRequested` — at open, on `Resized`,
+   and while egui animates. A first frame that rendered nothing had
+   nothing to rescue it and stayed blank permanently. Windows and Linux
+   almost always get a `Resized` after creation, which covered this up by
+   accident; a platform creating the window at exactly the requested size
+   sends none. It now retries until a frame renders content, capped at 120
+   frames, then reports on stderr rather than repainting forever.
+2. The surface was configured once at creation and thereafter only by
+   `Resized`, so the surface size and window size could silently diverge.
+   Now re-synced whenever they differ.
+
+**This is unconfirmed against the actual report** — the developer's Mac
+test loop is slow and the decisive question (does resizing the window make
+content appear?) was never answered. What the release *does* guarantee is
+that the next attempt produces evidence: `pain --settings --verbose=general`
+prints which of four things happened, and each points somewhere specific.
+Printing nothing at all would be the most informative outcome, meaning the
+window never redraws on macOS and this fix addressed the wrong mechanism.
+
+`--settings` was added in the same pass: it opens the settings window at
+startup, so reproducing a report about it is one command rather than three
+interactions. It is also how the fix was verified here at all (Linux
+reports `first content rendered at 460x720 after 0 retries`).
+
 **Distribution is fully automated.** Pushing a `v*` tag runs
 `.github/workflows/release.yml`, which builds four targets, publishes a
 GitHub Release with notes taken verbatim from `CHANGELOG.md`'s matching

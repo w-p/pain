@@ -4434,3 +4434,55 @@
 
   323 tests, clippy clean native + Windows cross-target, all six eras
   smoke-launched with zero wgpu validation errors.
+
+  **Update — 2026-07-31: settings window blank on macOS (v1.11.1).**
+  Developer reported the settings window completely empty on Mac.
+
+  **Ruled things out with evidence before hypothesising**, which is the
+  part worth repeating:
+  - `git diff v1.10.0..v1.11.0 -- crates/app/src/settings_window.rs` is
+    *empty* — the retro work never touched that file, so it can't be the
+    cause. The only v1.11.0 change reaching that window is one extra
+    section appended to `ui::settings_panel`, and if that were at fault
+    the earlier sections would still render.
+  - The developer reached Settings via the right-click menu, which is the
+    same egui context, chrome font and styling. So egui works on their
+    Mac. What differs is specifically the *second OS window* (new in
+    v1.10.0, shipped unverified on real hardware — project.md said so).
+  - The clear color was visible, so the render pass ran and presented.
+    That means egui produced **no geometry**, not that geometry failed to
+    draw. Narrows it a lot.
+
+  **Hypothesis:** the window repaints only on `RedrawRequested` (at open,
+  on `Resized`, while egui animates). A first frame that produced nothing
+  has nothing to rescue it. Windows/Linux almost always emit a `Resized`
+  after creation which covers that up by accident; a platform creating the
+  window at exactly the requested size emits none. Fits the platform split
+  and fits "blank forever" rather than "wrong size".
+
+  **Asked a narrowing question rather than firing a speculative fix**
+  (does resizing make content appear?) — per the standing note about
+  debugging blind. Developer's Mac/Linux loop is slow, so they asked to
+  proceed on the strength of it being a robustness hole regardless. Fair.
+
+  Fixed two holes, both real independent of the report: the retry-until-
+  rendered loop (capped at 120 frames, then a stderr report, and a resize
+  resets it), and a per-frame check that the surface size still matches
+  the window's — those could silently diverge since the surface was
+  configured once at creation and thereafter only by `Resized`.
+
+  **Added `--settings`**, which opens the settings window at startup. Two
+  reasons, both good: it made the fix *verifiable here* rather than shipped
+  on hypothesis (Linux prints `settings: first content rendered at 460x720
+  after 0 retries`), and it turns reproducing a settings-window report on a
+  slow-to-reach machine into one command.
+
+  **The important design choice: instrument so the next round-trip has
+  data.** `--settings --verbose=general` now prints one of four things on
+  the Mac — content rendered after N retries / surface-vs-window size
+  mismatch / gave up after 120 frames with the surface size / nothing at
+  all. Each points somewhere specific, and "nothing at all" would mean the
+  window never redraws on macOS and this fix addressed the wrong
+  mechanism. Shipped **unconfirmed** and said so plainly.
+
+  326 tests, clippy clean native + Windows cross-target.

@@ -95,6 +95,8 @@ configured shell.
 | `-h`, `--help` | Usage summary, including this machine's config file path |
 | `-V`, `--version` | Print the version |
 | `-v`, `--verbose[=LIST]` | Diagnostic logging on stderr |
+| `--era=NAME` | Use a retro era for this session (`--era=list` to see them) |
+| `--settings` | Open the settings window at startup |
 
 `LIST` is a comma-separated set of `general`, `mouse`, `pty`, `foreground`, or
 `all`. The bare flag enables `general` alone — the others fire constantly

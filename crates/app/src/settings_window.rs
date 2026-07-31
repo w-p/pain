@@ -34,6 +34,48 @@ const DEFAULT_SIZE: (f64, f64) = (460.0, 720.0);
 /// inside an `egui::Window`, which supplied this itself.
 const WINDOW_MARGIN: i8 = 10;
 
+/// How many frames a freshly opened window may spend failing to render
+/// content before it stops asking for more.
+///
+/// At the surface's `Fifo` present mode each retry costs one vsync, so this
+/// is a couple of seconds. The cap exists so a window that can *never* draw
+/// content degrades to "blank and idle" rather than repainting forever.
+const MAX_SETTLE_ATTEMPTS: u32 = 120;
+
+/// What a frame that hasn't rendered content yet should do next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Settle {
+    /// Content rendered; stop asking.
+    Done,
+    /// Nothing rendered, but it's early — ask for another frame.
+    Retry,
+    /// Nothing rendered after [`MAX_SETTLE_ATTEMPTS`]. Stop asking, so a
+    /// permanently broken window doesn't repaint at the display's rate for
+    /// as long as it stays open.
+    GiveUp,
+}
+
+/// Decides whether an unsettled window should ask for another frame.
+///
+/// This exists because the settings window can otherwise get permanently
+/// stuck blank. It repaints only on `RedrawRequested`, which arrives when it
+/// opens, on `Resized`, and while egui is animating — so a first frame that
+/// produced no geometry (a window that briefly reported a degenerate size,
+/// say) has nothing to rescue it. On Windows and Linux a `Resized` almost
+/// always follows window creation and covers that up by accident; a platform
+/// that creates the window at exactly the requested size sends none.
+///
+/// A free function so the policy is testable without a window or a GPU.
+fn settle_after_frame(drew_content: bool, attempts: u32) -> Settle {
+    if drew_content {
+        Settle::Done
+    } else if attempts < MAX_SETTLE_ATTEMPTS {
+        Settle::Retry
+    } else {
+        Settle::GiveUp
+    }
+}
+
 /// The settings window: its own OS window, surface and egui context, over
 /// the terminal window's GPU device.
 pub struct SettingsWindow {
@@ -47,6 +89,11 @@ pub struct SettingsWindow {
     /// the window's lifetime *is* the draft's lifetime: opening the window
     /// starts a draft from the current config, closing it discards one.
     draft: SettingsDraft,
+    /// Whether a frame has yet rendered any content. Until one has, each
+    /// frame asks for another — see [`settle_after_frame`].
+    settled: bool,
+    /// Frames spent trying to reach `settled`.
+    settle_attempts: u32,
     /// The keybinding list, built once when the window opens.
     ///
     /// Building it runs `Keymap::apply_overrides`, which reports
@@ -96,6 +143,8 @@ impl SettingsWindow {
             ctx,
             state,
             renderer,
+            settled: false,
+            settle_attempts: 0,
             draft: SettingsDraft::from_config(settings),
             binding_rows: crate::ui::effective_binding_rows(&settings.keybindings),
         })
@@ -125,6 +174,19 @@ impl SettingsWindow {
         if size.width == 0 || size.height == 0 {
             return;
         }
+        self.reconfigure(device, size);
+        // A resize is new information. If the window had given up on ever
+        // rendering content, this is reason to try again — and if it was
+        // already drawing fine, settling again costs one comparison.
+        self.settled = false;
+        self.settle_attempts = 0;
+    }
+
+    /// Points the surface at a new size without touching the settle state.
+    ///
+    /// Separate from `resize` so the per-frame drift check in `redraw` can't
+    /// reset the retry counter every frame and defeat its own cap.
+    fn reconfigure(&mut self, device: &wgpu::Device, size: winit::dpi::PhysicalSize<u32>) {
         self.config.width = size.width;
         self.config.height = size.height;
         self.surface.configure(device, &self.config);
@@ -137,6 +199,31 @@ impl SettingsWindow {
     /// the next frame's baseline and the edits would compound.
     pub fn redraw(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, settings: &config::Config) -> SettingsOutcome {
         self.ctx.set_visuals(crate::ui::graphite_visuals(settings.appearance.accent_rgb()));
+
+        // The surface is configured once at creation and thereafter only by
+        // `Resized`. If the window's real size ever differs from what the
+        // surface was told — a platform that resizes without sending the
+        // event, or that reports a different size than was requested at
+        // creation — the two disagree and the frame is drawn at the wrong
+        // scale or clipped away entirely. Re-syncing here costs one integer
+        // comparison per frame and removes a whole class of "window renders
+        // nothing" failures.
+        let size = self.window.inner_size();
+        if size.width == 0 || size.height == 0 {
+            // Nothing can be laid out into this. Ask for another frame
+            // rather than spending one producing no geometry.
+            self.request_settle_redraw();
+            return SettingsOutcome::default();
+        }
+        if size.width != self.config.width || size.height != self.config.height {
+            if crate::verbose::is_verbose(crate::verbose::Category::General) {
+                eprintln!(
+                    "settings: surface was {}x{} but the window is {}x{}; reconfiguring",
+                    self.config.width, self.config.height, size.width, size.height
+                );
+            }
+            self.reconfigure(device, size);
+        }
 
         let raw_input = self.state.take_egui_input(&self.window);
         let mut outcome = SettingsOutcome::default();
@@ -216,7 +303,43 @@ impl SettingsWindow {
             self.window.request_redraw();
         }
 
+        // A frame that drew nothing means the window is still blank, and
+        // nothing else is going to ask it to try again. See
+        // `settle_after_frame`.
+        if !self.settled {
+            match settle_after_frame(!primitives.is_empty(), self.settle_attempts) {
+                Settle::Done => {
+                    self.settled = true;
+                    if crate::verbose::is_verbose(crate::verbose::Category::General) {
+                        eprintln!(
+                            "settings: first content rendered at {}x{} after {} retries",
+                            self.config.width, self.config.height, self.settle_attempts
+                        );
+                    }
+                }
+                Settle::Retry => self.request_settle_redraw(),
+                Settle::GiveUp => {
+                    self.settled = true;
+                    eprintln!(
+                        "settings: the window rendered no content in {MAX_SETTLE_ATTEMPTS} frames \
+                         (surface {}x{}). It will stay blank; please report this.",
+                        self.config.width, self.config.height
+                    );
+                }
+            }
+        }
+
         outcome
+    }
+
+    /// Asks for another frame while the window has yet to render content.
+    ///
+    /// Rate-limited by the surface's `Fifo` present mode rather than by a
+    /// timer: each retry costs one vsync, and the attempt counter bounds how
+    /// many there can be.
+    fn request_settle_redraw(&mut self) {
+        self.settle_attempts = self.settle_attempts.saturating_add(1);
+        self.window.request_redraw();
     }
 }
 
@@ -232,4 +355,33 @@ fn panel_clear_color() -> wgpu::Color {
     let channel = |srgb: f64| if srgb <= 0.040_45 { srgb / 12.92 } else { ((srgb + 0.055) / 1.055).powf(2.4) };
     let [r, g, b] = crate::ui::PANEL_BG_RGB;
     wgpu::Color { r: channel(r), g: channel(g), b: channel(b), a: 1.0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The case this whole mechanism exists for: a window that rendered
+    /// nothing keeps asking, because nothing else will ask for it.
+    #[test]
+    fn a_frame_that_drew_nothing_asks_for_another() {
+        assert_eq!(settle_after_frame(false, 0), Settle::Retry);
+        assert_eq!(settle_after_frame(false, MAX_SETTLE_ATTEMPTS - 1), Settle::Retry);
+    }
+
+    #[test]
+    fn a_frame_that_drew_content_stops_asking() {
+        assert_eq!(settle_after_frame(true, 0), Settle::Done);
+        // Content after several failed attempts still settles, rather than
+        // being counted out.
+        assert_eq!(settle_after_frame(true, MAX_SETTLE_ATTEMPTS + 10), Settle::Done);
+    }
+
+    /// A window that can never draw has to stop asking, or it would repaint
+    /// at the display's refresh rate for as long as it stayed open.
+    #[test]
+    fn retrying_is_bounded() {
+        assert_eq!(settle_after_frame(false, MAX_SETTLE_ATTEMPTS), Settle::GiveUp);
+        assert_eq!(settle_after_frame(false, u32::MAX), Settle::GiveUp);
+    }
 }
