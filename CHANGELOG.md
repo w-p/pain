@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.11.2
+
 - Fixed, macOS: the settings window opened completely empty, and could then
   crash. The window ran its interface and *then* asked for somewhere to draw
   it — and on macOS that request routinely fails the first time for a window
