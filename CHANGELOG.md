@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.11.1
+
 - Fixed: the settings window could open blank and stay that way. It repaints
   only when something asks it to — when it opens, when it is resized, and
   while a widget is animating — so a first frame that rendered nothing had
