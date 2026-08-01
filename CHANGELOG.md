@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.11.3
+
 - Fixed, macOS: a trackpad couldn't scroll the terminal at all. A trackpad
   reports scrolling in pixels, as a stream of small movements while your
   fingers move, and each one was converted to whole lines and rounded on its

@@ -5,4 +5,4 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-layout = { version = "1.11.2", path = "../layout" }
+layout = { version = "1.11.3", path = "../layout" }
