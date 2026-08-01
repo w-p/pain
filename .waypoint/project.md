@@ -151,6 +151,16 @@ own*: primitives were non-empty, they simply referenced a missing texture.
 A "did it render?" check that only counts geometry cannot see this class of
 failure.
 
+**Trackpad scrolling dead on macOS — fixed in v1.11.3.** Each scroll event
+was converted to whole lines and rounded on its own, so a trackpad's small
+pixel deltas (1-10px against a ~33px Retina row) all became zero and were
+discarded, with no fraction carried. Wheels send whole notches and were
+unaffected, which is why only Macs with trackpads saw it.
+`crates/app/src/scroll.rs` now carries the remainder between events.
+**Not reproduced end to end** (no trackpad here, and WSLg sends no
+`PixelDelta`) — the diagnosis rests on the discard being visible in the
+code and the arithmetic using the user's own logged cell size.
+
 **Distribution is fully automated.** Pushing a `v*` tag runs
 `.github/workflows/release.yml`, which builds four targets, publishes a
 GitHub Release with notes taken verbatim from `CHANGELOG.md`'s matching

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Fixed, macOS: a trackpad couldn't scroll the terminal at all. A trackpad
+  reports scrolling in pixels, as a stream of small movements while your
+  fingers move, and each one was converted to whole lines and rounded on its
+  own — so anything shorter than half a text row became zero and was thrown
+  away. On a Retina display a row is about 33 pixels tall and those
+  movements are usually under ten, so every one of them was discarded and
+  the terminal never scrolled however long you swiped.
+
+  Leftover movement now carries over between events until it adds up to a
+  line. A mouse wheel, which reports whole notches rather than pixels, was
+  never affected and still scrolls immediately.
+
 ## v1.11.2
 
 - Fixed, macOS: the settings window opened completely empty, and could then

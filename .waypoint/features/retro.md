@@ -12,7 +12,6 @@ name.
 - `crates/config/src/lib.rs` — the `[retro]` section and its resolution.
 - `crates/pane/src/retro.rs` — the OSC 7331 scanner.
 - `crates/render/src/effects.wgsl` — the scanline/vignette overlay pass.
-- `assets/fonts/` — the bundled typefaces and their licences.
 
 ## The design question this answers
 
@@ -27,8 +26,8 @@ of engineering:
 
 1. **Effects** — scanlines and a vignette, which is what makes green text look
    like a phosphor tube rather than green text.
-2. **Font** — arguably the biggest visual difference of all, and the reason
-   VT323 is now compiled in rather than merely named.
+2. **Font** — arguably the biggest visual difference of all, though it is the
+   one an era can only *ask* for rather than guarantee. See Fonts below.
 
 A third lever, output pacing, was built and then removed; see below.
 

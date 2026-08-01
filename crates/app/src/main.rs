@@ -24,6 +24,7 @@ mod pane_session;
 mod paste;
 mod platform;
 mod run;
+mod scroll;
 mod session_cwd;
 mod settings_window;
 mod ui;

@@ -4531,3 +4531,45 @@
   Also fixed: the dropped-surface arms returned without requesting another
   frame (a window that repaints only on request could stop drawing), and
   dropped the texture *free* list, leaking one texture per dropped frame.
+
+  **Update — 2026-07-31: trackpad scrolling dead on macOS (v1.11.3).**
+  Mac user couldn't scroll terminals with the trackpad. Diagnosed from the
+  code plus the cell size in their *earlier* log (`cell 16x33px`), no new
+  round-trip needed.
+
+  `Graphics::scroll_at` converted each scroll event to lines and rounded it
+  **independently**:
+  `PixelDelta(px) => (px.y as f32 / self.cell.1).round()`.
+  A trackpad reports pixels as a stream of small deltas (typically 1-10px);
+  a Retina text row is ~33px. So every delta rounded to 0, hit the
+  `if lines == 0 { return false }` guard, and was discarded — and the
+  fraction was never carried, so it was lost rather than accumulating.
+  Nothing scrolled however long you swiped. A wheel sends
+  `LineDelta(0, ±1)` → rounds to ±1 → fine, which is why Windows, Linux and
+  a Mac *with a mouse* all worked.
+
+  Fix: `crates/app/src/scroll.rs`, an accumulator carrying the fractional
+  remainder between events, reset when the pointer moves to a different
+  pane (momentum shouldn't spend itself on the pane you cross). Modelled
+  against their real numbers: a ~112px swipe went from 0 lines to 3, versus
+  3.39 rows of actual finger movement.
+
+  **My own test caught a genuine wart, and the test was also wrong.** It
+  asserted N events summing to one line produce exactly one line — which
+  floating point cannot promise. Chasing it surfaced that winit reports
+  pixel deltas as `f64` and the code downcast to `f32` for nothing. Fixed
+  both: accumulator is `f64`, and the test now asserts the honest invariant
+  (no *systematic* loss over 100 lines) rather than exact equality.
+
+  Guarded non-finite deltas: a zero cell height would divide by zero and
+  poison the remainder permanently, after which nothing would scroll again
+  for the whole session.
+
+  **Not reproduced end to end** — no trackpad here and WSLg delivers no
+  `PixelDelta`. Diagnosis rests on the discard being visible in the code
+  and the arithmetic using *their* logged cell size. If it fails, the next
+  signal is `--verbose=mouse` while swiping, which prints every delta.
+
+  Noticed and deliberately left alone: a wheel notch scrolls exactly 1
+  line, where most terminals do 3. Pre-existing on every platform, nobody
+  has complained, and changing it is a feel change nobody asked for.

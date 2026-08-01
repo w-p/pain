@@ -226,6 +226,11 @@ pub struct Graphics {
     /// settings panel saves from `settings`, so folding a transient era in
     /// there would let trying one on permanently rewrite the user's config.
     era_override: Option<&'static config::era::Era>,
+    /// Carries fractional scroll between events, and which pane it belongs
+    /// to — see `crate::scroll`. A trackpad reports pixels, and a single
+    /// delta is usually a fraction of a text row.
+    scroll: crate::scroll::Accumulator,
+    scroll_pane: Option<PaneId>,
     /// Whether the OS says this window has focus. Animation stops when it
     /// doesn't: a retro terminal sitting behind your editor has no business
     /// waking the GPU twenty times a second to move a bar nobody is looking
@@ -520,6 +525,8 @@ impl Graphics {
             selecting: None,
             hovered_url: None,
             era_override: None,
+            scroll: crate::scroll::Accumulator::default(),
+            scroll_pane: None,
             window_focused: true,
             animation_epoch: std::time::Instant::now(),
             last_animation_frame: std::time::Instant::now(),
@@ -1306,14 +1313,28 @@ impl Graphics {
     /// found under `pos` (and so needs a redraw) — nothing under the
     /// cursor means nothing to scroll.
     pub fn scroll_at(&mut self, pos: (f32, f32), delta: winit::event::MouseScrollDelta) -> bool {
+        let Some(pane) = self.pane_at(pos) else { return false };
+        // Momentum built up over one pane shouldn't spend itself on the next
+        // one the pointer crosses.
+        if self.scroll_pane != Some(pane) {
+            self.scroll_pane = Some(pane);
+            self.scroll.reset();
+        }
+
+        // Both arms end up in *lines*, fractional included, and the
+        // accumulator turns a run of fractions into whole lines. Rounding
+        // each event on its own instead discarded every trackpad delta
+        // smaller than half a row, which on a Retina display is most of them
+        // — see `crate::scroll`.
         let lines = match delta {
-            winit::event::MouseScrollDelta::LineDelta(_, y) => y.round() as i32,
-            winit::event::MouseScrollDelta::PixelDelta(px) => (px.y as f32 / self.cell.1).round() as i32,
+            winit::event::MouseScrollDelta::LineDelta(_, y) => f64::from(y),
+            winit::event::MouseScrollDelta::PixelDelta(px) => px.y / f64::from(self.cell.1),
         };
+        let lines = self.scroll.take_lines(lines);
         if lines == 0 {
             return false;
         }
-        let Some(pane) = self.pane_at(pos) else { return false };
+
         let Some(session) = self.panes.get_mut(&pane) else { return false };
         session.scroll(lines);
         true
